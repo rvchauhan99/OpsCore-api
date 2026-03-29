@@ -63,6 +63,7 @@ module.exports = (db) => {
     QcTemplate,
     QcCheck,
     CostSheet,
+    ProductionScheduleEntry,
   } = db;
 
   const Product = db.Product;
@@ -396,6 +397,10 @@ module.exports = (db) => {
     ChallanItems.belongsTo(Product, { foreignKey: "product_id", as: "product" });
     Product.hasMany(ChallanItems, { foreignKey: "product_id", as: "challanItems" });
   }
+  if (ChallanItems && B2BSalesOrderItem) {
+    ChallanItems.belongsTo(B2BSalesOrderItem, { foreignKey: "b2b_sales_order_item_id", as: "b2bSalesOrderItem" });
+    B2BSalesOrderItem.hasMany(ChallanItems, { foreignKey: "b2b_sales_order_item_id", as: "challanItems" });
+  }
 
   // ── B2B Sales ─────────────────────────────────────────────────────────────────
   if (B2BClient && B2BClientShipTo) {
@@ -571,6 +576,33 @@ module.exports = (db) => {
   if (ManufacturingOrder && B2BSalesOrder) {
     ManufacturingOrder.belongsTo(B2BSalesOrder, { foreignKey: "sales_order_id", as: "salesOrder" });
     B2BSalesOrder.hasMany(ManufacturingOrder, { foreignKey: "sales_order_id", as: "manufacturingOrders" });
+  }
+
+  if (ManufacturingOrder && B2BSalesOrderItem) {
+    ManufacturingOrder.belongsTo(B2BSalesOrderItem, {
+      foreignKey: "b2b_sales_order_item_id",
+      as: "b2bSalesOrderItem",
+    });
+    B2BSalesOrderItem.hasMany(ManufacturingOrder, {
+      foreignKey: "b2b_sales_order_item_id",
+      as: "manufacturingOrders",
+    });
+  }
+
+  // Production schedule
+  if (ProductionScheduleEntry && ManufacturingOrder) {
+    ProductionScheduleEntry.belongsTo(ManufacturingOrder, {
+      foreignKey: "manufacturing_order_id",
+      as: "manufacturingOrder",
+    });
+    ManufacturingOrder.hasMany(ProductionScheduleEntry, {
+      foreignKey: "manufacturing_order_id",
+      as: "scheduleEntries",
+    });
+  }
+  if (ProductionScheduleEntry && WorkCenter) {
+    ProductionScheduleEntry.belongsTo(WorkCenter, { foreignKey: "work_center_id", as: "workCenter" });
+    WorkCenter.hasMany(ProductionScheduleEntry, { foreignKey: "work_center_id", as: "scheduleEntries" });
   }
 
   // Work Order ↔ Manufacturing Order

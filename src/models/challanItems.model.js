@@ -22,6 +22,11 @@ const ChallanItems = sequelize.define(
             allowNull: false,
         },
 
+        b2b_sales_order_item_id: {
+            type: DataTypes.INTEGER,
+            allowNull: true,
+        },
+
         quantity: {
             type: DataTypes.DECIMAL(10, 2),
             allowNull: false,

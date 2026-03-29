@@ -7,6 +7,11 @@ const pdfService = require("./pdf.service.js");
 const { getTenantModels } = require("../tenant/tenantModels.js");
 const bucketService = require("../../common/services/bucket.service.js");
 
+const listPendingDelivery = asyncHandler(async (req, res) => {
+  const rows = await b2bSalesOrdersService.listPendingDeliverySummaries();
+  return responseHandler.sendSuccess(res, rows, "Pending delivery orders fetched", 200);
+});
+
 const list = asyncHandler(async (req, res) => {
   const { q, page = 1, limit = 20, sortBy = "id", sortOrder = "DESC" } = req.query;
   const result = await b2bSalesOrdersService.listOrders({
@@ -186,6 +191,7 @@ const generatePDF = asyncHandler(async (req, res) => {
 
 module.exports = {
   list,
+  listPendingDelivery,
   getById,
   getNextNumber,
   create,

@@ -140,15 +140,115 @@ const getOrderById = async ({ id }) => {
       if (oiId) shippedByOrderItemId[oiId] = (shippedByOrderItemId[oiId] || 0) + (parseInt(it.quantity, 10) || 0);
     });
   });
+
+  const { Challan, ChallanItems } = models;
+  const challanShippedByOrderItemId = {};
+  if (Challan && ChallanItems) {
+    const challans = await Challan.findAll({
+      where: { b2b_sales_order_id: id, deleted_at: null, is_reversed: false },
+      include: [{ model: ChallanItems, as: "items" }],
+    });
+    challans.forEach((c) => {
+      (c.items || []).forEach((ci) => {
+        const q = parseFloat(ci.quantity) || 0;
+        const oiId = ci.b2b_sales_order_item_id;
+        if (oiId) {
+          challanShippedByOrderItemId[oiId] = (challanShippedByOrderItemId[oiId] || 0) + q;
+        } else {
+          const match = (order.items || []).find((oi) => oi.product_id === ci.product_id);
+          if (match) {
+            challanShippedByOrderItemId[match.id] = (challanShippedByOrderItemId[match.id] || 0) + q;
+          }
+        }
+      });
+    });
+  }
+
   (order.items || []).forEach((it) => {
     const ordered = parseInt(it.quantity, 10) || 0;
-    const shipped = shippedByOrderItemId[it.id] || 0;
+    const fromShipments = shippedByOrderItemId[it.id] || 0;
+    const fromChallans = challanShippedByOrderItemId[it.id] || 0;
+    const shipped = fromShipments + fromChallans;
     it.dataValues.ordered_qty = ordered;
     it.dataValues.shipped_qty = shipped;
     it.dataValues.returned_qty = 0;
     it.dataValues.pending_qty = Math.max(0, ordered - shipped);
   });
   return order;
+};
+
+/** Summaries for delivery challan order picker: confirmed B2B orders with remaining qty to dispatch. */
+const listPendingDeliverySummaries = async () => {
+  const models = getTenantModels();
+  const {
+    B2BSalesOrder,
+    B2BSalesOrderItem,
+    B2BClient,
+    CompanyWarehouse,
+    B2BShipment,
+    B2BShipmentItem,
+    Challan,
+    ChallanItems,
+  } = models;
+
+  const rows = await B2BSalesOrder.findAll({
+    where: { deleted_at: null, status: "CONFIRMED" },
+    include: [
+      { model: B2BClient, as: "client", attributes: ["id", "client_name"] },
+      { model: CompanyWarehouse, as: "plannedWarehouse", attributes: ["id", "name"] },
+      { model: B2BSalesOrderItem, as: "items", attributes: ["id", "product_id", "quantity"] },
+    ],
+    order: [["id", "DESC"]],
+    limit: 400,
+  });
+
+  const out = [];
+  for (const order of rows) {
+    const prevByProduct = {};
+    const add = (pid, q) => {
+      if (pid == null) return;
+      prevByProduct[pid] = (prevByProduct[pid] || 0) + q;
+    };
+
+    const shipments = await B2BShipment.findAll({
+      where: { b2b_sales_order_id: order.id, deleted_at: null },
+      include: [{ model: B2BShipmentItem, as: "items" }],
+    });
+    shipments.forEach((s) => {
+      (s.items || []).forEach((it) => add(it.product_id, parseInt(it.quantity, 10) || 0));
+    });
+
+    if (Challan && ChallanItems) {
+      const challans = await Challan.findAll({
+        where: { b2b_sales_order_id: order.id, deleted_at: null, is_reversed: false },
+        include: [{ model: ChallanItems, as: "items" }],
+      });
+      challans.forEach((c) => {
+        (c.items || []).forEach((ci) => add(ci.product_id, parseFloat(ci.quantity) || 0));
+      });
+    }
+
+    let hasPending = false;
+    for (const it of order.items || []) {
+      const ordered = parseInt(it.quantity, 10) || 0;
+      const done = prevByProduct[it.product_id] || 0;
+      if (ordered > done) {
+        hasPending = true;
+        break;
+      }
+    }
+
+    if (hasPending) {
+      out.push({
+        id: order.id,
+        order_number: order.order_no,
+        customer_name: order.client?.client_name || null,
+        planned_warehouse_name: order.plannedWarehouse?.name || null,
+      });
+    }
+  }
+
+  return out;
 };
 
 const computeTotals = (items) => {
@@ -439,6 +539,7 @@ const getOrderItemsForShipment = async ({ orderId }) => {
 module.exports = {
   generateOrderNumber,
   listOrders,
+  listPendingDeliverySummaries,
   getOrderById,
   createOrder,
   createFromQuote,

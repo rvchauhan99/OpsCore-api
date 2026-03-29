@@ -9,9 +9,7 @@ const requiredEnvVars = {
     "DB_HOST",
     "JWT_SECRET_ACCESS_TOKEN",
     "JWT_SECRET_REFRESH_TOKEN",
-    "BREVO_USER",
-    "BREVO_MASTER_KEY",
-    "BREVO_FROM",
+    // Brevo (email) optional locally — set BREVO_* when testing mail; auth OTP may need it in some flows
   ],
   production: [
     "DB_USER",
@@ -74,6 +72,15 @@ const validateEnv = () => {
     });
     console.error("\nPlease set these variables in your .env file");
     process.exit(1);
+  }
+
+  if (env === "development") {
+    const brevo = ["BREVO_USER", "BREVO_MASTER_KEY", "BREVO_FROM"].filter((k) => !process.env[k]);
+    if (brevo.length > 0) {
+      console.warn(
+        "⚠️  Email (Brevo) not fully configured — password reset / OTP emails may fail until BREVO_USER, BREVO_MASTER_KEY, BREVO_FROM are set."
+      );
+    }
   }
 
   console.log("✅ All required environment variables are set");

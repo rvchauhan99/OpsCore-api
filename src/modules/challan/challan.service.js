@@ -87,6 +87,7 @@ const updateOrderBomShippedQuantities = async (orderId, transaction = null) => {
     if (!orderId) return;
     const models = getTenantModels();
     const { Order, Challan, ChallanItems } = models;
+    if (!Order) return;
     const order = await Order.findOne({
         where: { id: orderId, deleted_at: null },
         attributes: ["id", "bom_snapshot"],
@@ -175,6 +176,7 @@ const recomputeOrderDeliveryStatus = async (orderId, transaction = null) => {
     if (!orderId) return;
     const models = getTenantModels();
     const { Order, Challan } = models;
+    if (!Order) return;
     const order = await Order.findOne({
         where: { id: orderId, deleted_at: null },
         attributes: ["id", "bom_snapshot", "delivery_status"],
@@ -265,7 +267,7 @@ const listChallans = async ({
     created_by: createdById = null,
 } = {}) => {
     const models = getTenantModels();
-    const { Challan, ChallanItems, Order, CompanyWarehouse, User, Customer } = models;
+    const { Challan, ChallanItems, Order, B2BSalesOrder, B2BClient, CompanyWarehouse, User, Customer } = models;
     const offset = (page - 1) * limit;
     // Include also soft-deleted challans (e.g. reversed) in listing.
     // Reverse is implemented via deleteChallan() which soft-deletes challan.
@@ -305,7 +307,10 @@ const listChallans = async ({
             : [];
 
     if (order_id) {
-        where.order_id = order_id;
+        where[Op.and] = where[Op.and] || [];
+        where[Op.and].push({
+            [Op.or]: [{ order_id }, { b2b_sales_order_id: order_id }],
+        });
     }
 
     if (isReversed !== null) {
@@ -313,12 +318,24 @@ const listChallans = async ({
     }
 
     if (search) {
-        where[Op.or] = [
+        const searchOr = [
             { challan_no: { [Op.iLike]: `%${search}%` } },
             { transporter: { [Op.iLike]: `%${search}%` } },
-            { "$order.customer.customer_name$": { [Op.iLike]: `%${search}%` } },
-            { "$order.customer.mobile_number$": { [Op.iLike]: `%${search}%` } },
         ];
+        if (Order) {
+            searchOr.push(
+                { "$order.customer.customer_name$": { [Op.iLike]: `%${search}%` } },
+                { "$order.customer.mobile_number$": { [Op.iLike]: `%${search}%` } }
+            );
+        }
+        if (B2BSalesOrder) {
+            searchOr.push(
+                { "$b2bSalesOrder.client.client_name$": { [Op.iLike]: `%${search}%` } },
+                { "$b2bSalesOrder.client.phone$": { [Op.iLike]: `%${search}%` } },
+                { "$b2bSalesOrder.order_no$": { [Op.iLike]: `%${search}%` } }
+            );
+        }
+        where[Op.or] = searchOr;
     }
 
     // Exact challan_no filter with operators
@@ -356,8 +373,8 @@ const listChallans = async ({
         if (cond) where[Op.and].push(cond);
     }
 
-    // delivery_status filter (exact match, case-insensitive)
-    if (deliveryStatus) {
+    // delivery_status filter (legacy solar order field only)
+    if (deliveryStatus && Order) {
         where[Op.and] = where[Op.and] || [];
         const cond = buildStringCondition("$order.delivery_status$", deliveryStatus, "equals");
         if (cond) where[Op.and].push(cond);
@@ -417,27 +434,55 @@ const listChallans = async ({
         where.warehouse_id = { [Op.in]: allowedManagedWarehouseIds };
     }
 
-    // Related model filters
+    // Related model filters (legacy solar orders)
     const orderWhereAnd = [];
-    if (orderNumber) {
+    if (orderNumber && Order) {
         const orderNumberCond = buildStringCondition("order_number", orderNumber, "contains");
         if (orderNumberCond) orderWhereAnd.push(orderNumberCond);
     }
-    if (handledBy) {
+    if (handledBy && Order) {
         orderWhereAnd.push({ handled_by: handledBy });
     }
     const orderWhere = orderWhereAnd.length > 0 ? { [Op.and]: orderWhereAnd } : null;
 
-    // Customer filters (applied via nested association "$order.customer.field$")
+    const b2bOrderWhereAnd = [];
+    if (orderNumber && B2BSalesOrder) {
+        const c = buildStringCondition("order_no", orderNumber, "contains");
+        if (c) b2bOrderWhereAnd.push(c);
+    }
+    if (handledBy && B2BSalesOrder) {
+        b2bOrderWhereAnd.push({ user_id: handledBy });
+    }
+    const b2bOrderWhere = b2bOrderWhereAnd.length > 0 ? { [Op.and]: b2bOrderWhereAnd } : null;
+
+    const b2bAssocRequired =
+        !!b2bOrderWhere ||
+        !!customerName ||
+        !!customerMobile ||
+        !!(deliveryStatus && !Order && B2BSalesOrder);
+
+    // Customer filters
     if (customerName) {
         where[Op.and] = where[Op.and] || [];
-        const cond = buildStringCondition("$order.customer.customer_name$", customerName, "contains");
-        if (cond) where[Op.and].push(cond);
+        if (Order) {
+            const cond = buildStringCondition("$order.customer.customer_name$", customerName, "contains");
+            if (cond) where[Op.and].push(cond);
+        }
+        if (B2BSalesOrder) {
+            const cond = buildStringCondition("$b2bSalesOrder.client.client_name$", customerName, "contains");
+            if (cond) where[Op.and].push(cond);
+        }
     }
     if (customerMobile) {
         where[Op.and] = where[Op.and] || [];
-        const cond = buildStringCondition("$order.customer.mobile_number$", customerMobile, "contains");
-        if (cond) where[Op.and].push(cond);
+        if (Order) {
+            const cond = buildStringCondition("$order.customer.mobile_number$", customerMobile, "contains");
+            if (cond) where[Op.and].push(cond);
+        }
+        if (B2BSalesOrder) {
+            const cond = buildStringCondition("$b2bSalesOrder.client.phone$", customerMobile, "contains");
+            if (cond) where[Op.and].push(cond);
+        }
     }
 
     if (Array.isArray(enforcedHandledByIds)) {
@@ -446,17 +491,17 @@ const listChallans = async ({
         const handledIds = enforcedHandledByIds.length > 0 ? enforcedHandledByIds : [-1];
         const warehouseIds = allowedManagedWarehouseIds.length > 0 ? allowedManagedWarehouseIds : [-1];
 
-        // Visibility union:
-        // - created_by in team ids
-        // - order.handled_by in team ids
-        // - OR challan.warehouse_id in warehouses managed by team/user
-        where[Op.and].push({
-            [Op.or]: [
-                { created_by: { [Op.in]: handledIds } },
-                { "$order.handled_by$": { [Op.in]: handledIds } },
-                { warehouse_id: { [Op.in]: warehouseIds } },
-            ],
-        });
+        const visOr = [
+            { created_by: { [Op.in]: handledIds } },
+            { warehouse_id: { [Op.in]: warehouseIds } },
+        ];
+        if (Order) {
+            visOr.push({ "$order.handled_by$": { [Op.in]: handledIds } });
+        }
+        if (B2BSalesOrder) {
+            visOr.push({ "$b2bSalesOrder.user_id$": { [Op.in]: handledIds } });
+        }
+        where[Op.and].push({ [Op.or]: visOr });
     }
     const warehouseWhere = warehouseName
         ? buildStringCondition("name", warehouseName, "contains")
@@ -467,6 +512,76 @@ const listChallans = async ({
         : "id";
     const sortDir = String(sortOrder).toUpperCase() === "ASC" ? "ASC" : "DESC";
 
+    const listIncludes = [];
+    if (Order) {
+        listIncludes.push({
+            model: Order,
+            as: "order",
+            attributes: ["id", "order_number", "handled_by", "capacity", "consumer_no", "current_stage_key", "delivery_status"],
+            required: !!orderWhere || !!(customerName && Order) || !!(customerMobile && Order) || !!(deliveryStatus && Order) || !!search,
+            ...(orderWhere && { where: orderWhere }),
+            include: [
+                {
+                    model: Customer,
+                    as: "customer",
+                    attributes: ["id", "customer_name", "mobile_number", "address", "district"],
+                    required: !!(customerName || customerMobile || search),
+                },
+                {
+                    model: User,
+                    as: "handledBy",
+                    attributes: ["id", "name"],
+                },
+            ],
+        });
+    }
+    if (B2BSalesOrder) {
+        listIncludes.push({
+            model: B2BSalesOrder,
+            as: "b2bSalesOrder",
+            attributes: ["id", "order_no", "user_id", "status"],
+            required: b2bAssocRequired,
+            ...(b2bOrderWhere && { where: b2bOrderWhere }),
+            include: [
+                {
+                    model: B2BClient,
+                    as: "client",
+                    attributes: ["id", "client_name", "phone", "billing_address", "billing_district"],
+                    required: !!(customerName || customerMobile || search),
+                },
+                { model: User, as: "user", attributes: ["id", "name"] },
+            ],
+        });
+    }
+
+    listIncludes.push(
+        {
+            model: User,
+            as: "createdByUser",
+            attributes: ["id", "name"],
+            required: !!createdByName,
+        },
+        {
+            model: User,
+            as: "reversedByUser",
+            attributes: ["id", "name"],
+            required: false,
+        },
+        {
+            model: CompanyWarehouse,
+            as: "warehouse",
+            attributes: ["id", "name"],
+            required: !!warehouseWhere,
+            ...(warehouseWhere && { where: warehouseWhere }),
+        },
+        {
+            model: ChallanItems,
+            as: "items",
+            attributes: ["id"],
+            separate: true,
+        }
+    );
+
     const { count, rows } = await Challan.findAndCountAll({
         where,
         limit,
@@ -474,77 +589,51 @@ const listChallans = async ({
         order: [[sortField, sortDir]],
         subQuery: false,
         paranoid: false,
-        include: [
-            {
-                model: Order,
-                as: "order",
-                attributes: ["id", "order_number", "handled_by", "capacity", "consumer_no", "current_stage_key", "delivery_status"],
-                required: !!orderWhere || !!customerName || !!customerMobile || !!deliveryStatus || !!search,
-                ...(orderWhere && { where: orderWhere }),
-                include: [
-                    {
-                        model: Customer,
-                        as: "customer",
-                        attributes: ["id", "customer_name", "mobile_number", "address", "district"],
-                        required: !!customerName || !!customerMobile || !!search,
-                    },
-                    {
-                        model: User,
-                        as: "handledBy",
-                        attributes: ["id", "name"],
-                    },
-                ],
-            },
-            {
-                model: User,
-                as: "createdByUser",
-                attributes: ["id", "name"],
-                required: !!createdByName,
-            },
-            {
-                model: User,
-                as: "reversedByUser",
-                attributes: ["id", "name"],
-                required: false,
-            },
-            {
-                model: CompanyWarehouse,
-                as: "warehouse",
-                attributes: ["id", "name"],
-                required: !!warehouseWhere,
-                ...(warehouseWhere && { where: warehouseWhere }),
-            },
-            {
-                model: ChallanItems,
-                as: "items",
-                attributes: ["id"],
-                // Avoid pagination mismatch from hasMany join row duplication.
-                // Listing needs only items count/length, and `separate` fetches items per challan.
-                separate: true,
-            },
-        ],
+        include: listIncludes,
         distinct: true,
     });
 
     const data = (rows || []).map((c) => {
         const row = c.toJSON();
         const orderObj = row.order || {};
-        const customer = orderObj.customer || null;
+        const b2b = row.b2bSalesOrder || {};
+        const b2bClient = b2b.client || null;
+        const customerFromSolar = orderObj.customer || null;
+        const customer =
+            customerFromSolar ||
+            (b2bClient
+                ? {
+                      id: b2bClient.id,
+                      customer_name: b2bClient.client_name,
+                      mobile_number: b2bClient.phone,
+                      address: b2bClient.billing_address,
+                      district: b2bClient.billing_district,
+                  }
+                : null);
+        const orderPayload = orderObj.id
+            ? {
+                  id: orderObj.id,
+                  order_number: orderObj.order_number,
+                  capacity: orderObj.capacity,
+                  consumer_no: orderObj.consumer_no,
+                  current_stage_key: orderObj.current_stage_key,
+              }
+            : b2b.id
+              ? {
+                    id: b2b.id,
+                    order_number: b2b.order_no,
+                    capacity: null,
+                    consumer_no: null,
+                    current_stage_key: null,
+                }
+              : null;
         return {
             id: row.id,
             challan_no: row.challan_no,
             challan_date: row.challan_date,
             transporter: row.transporter,
             delivery_status: orderObj.delivery_status ?? null,
-            order: row.order
-                ? {
-                      id: orderObj.id,
-                      order_number: orderObj.order_number,
-                      capacity: orderObj.capacity,
-                      consumer_no: orderObj.consumer_no,
-                      current_stage_key: orderObj.current_stage_key,
-                  }
-                : null,
+            order: orderPayload,
             customer: customer
                 ? {
                       id: customer.id,
@@ -558,7 +647,7 @@ const listChallans = async ({
             is_reversed: row.is_reversed ?? false,
             reversed_at: row.reversed_at ?? null,
             reversed_by_name: row.reversedByUser?.name ?? null,
-            handled_by_name: orderObj.handledBy?.name || null,
+            handled_by_name: orderObj.handledBy?.name || b2b.user?.name || null,
             warehouse: row.warehouse ? { id: row.warehouse.id, name: row.warehouse.name } : null,
             items: row.items || [],
             created_at: row.created_at,
@@ -582,81 +671,122 @@ const listChallans = async ({
  */
 const getChallanById = async ({ id, transaction } = {}) => {
     const models = getTenantModels();
-    const { Challan, ChallanItems, Order, CompanyWarehouse, Product, ProductType, MeasurementUnit, Customer, User, ProjectScheme, Discom } = models;
+    const {
+        Challan,
+        ChallanItems,
+        Order,
+        CompanyWarehouse,
+        Product,
+        ProductType,
+        MeasurementUnit,
+        Customer,
+        User,
+        ProjectScheme,
+        Discom,
+        B2BSalesOrder,
+        B2BClient,
+    } = models;
+
+    const include = [];
+    if (Order) {
+        include.push({
+            model: Order,
+            as: "order",
+            attributes: [
+                "id", "order_number", "consumer_no", "capacity", "handled_by",
+                "order_date", "status", "project_cost", "discount", "delivery_status",
+                "payment_type", "demand_load",
+            ],
+            required: false,
+            include: [
+                {
+                    model: Customer,
+                    as: "customer",
+                    attributes: [
+                        "id", "customer_name", "mobile_number", "company_name",
+                        "phone_no", "email_id", "pin_code", "address",
+                        "landmark_area", "taluka", "district",
+                    ],
+                },
+                {
+                    model: User,
+                    as: "handledBy",
+                    attributes: ["id", "name"],
+                },
+                {
+                    model: ProjectScheme,
+                    as: "projectScheme",
+                    attributes: ["id", "name"],
+                },
+                {
+                    model: Discom,
+                    as: "discom",
+                    attributes: ["id", "name"],
+                },
+            ],
+        });
+    }
+    if (B2BSalesOrder) {
+        include.push({
+            model: B2BSalesOrder,
+            as: "b2bSalesOrder",
+            attributes: ["id", "order_no", "order_date", "status", "grand_total"],
+            required: false,
+            include: [
+                {
+                    model: B2BClient,
+                    as: "client",
+                    attributes: [
+                        "id", "client_name", "phone", "email",
+                        "billing_address", "billing_city", "billing_district", "billing_state", "billing_pincode",
+                    ],
+                },
+                { model: User, as: "user", attributes: ["id", "name"] },
+            ],
+        });
+    }
+
+    include.push(
+        {
+            model: CompanyWarehouse,
+            as: "warehouse",
+            attributes: ["id", "name", "contact_person", "mobile", "phone_no", "email", "address"],
+        },
+        {
+            model: User,
+            as: "reversedByUser",
+            attributes: ["id", "name"],
+            required: false,
+        },
+        {
+            model: ChallanItems,
+            as: "items",
+            include: [
+                {
+                    model: Product,
+                    as: "product",
+                    include: [
+                        {
+                            model: ProductType,
+                            as: "productType",
+                            attributes: ["id", "name"],
+                        },
+                        {
+                            model: MeasurementUnit,
+                            as: "measurementUnit",
+                            attributes: ["id", "unit"],
+                        },
+                    ],
+                },
+            ],
+        }
+    );
+
     const challan = await Challan.findOne({
         where: { id },
         paranoid: false,
         transaction,
-        include: [
-            {
-                model: Order,
-                as: "order",
-                attributes: [
-                    "id", "order_number", "consumer_no", "capacity", "handled_by",
-                    "order_date", "status", "project_cost", "discount", "delivery_status",
-                    "payment_type", "demand_load",
-                ],
-                include: [
-                    {
-                        model: Customer,
-                        as: "customer",
-                        attributes: [
-                            "id", "customer_name", "mobile_number", "company_name",
-                            "phone_no", "email_id", "pin_code", "address",
-                            "landmark_area", "taluka", "district",
-                        ],
-                    },
-                    {
-                        model: User,
-                        as: "handledBy",
-                        attributes: ["id", "name"],
-                    },
-                    {
-                        model: ProjectScheme,
-                        as: "projectScheme",
-                        attributes: ["id", "name"],
-                    },
-                    {
-                        model: Discom,
-                        as: "discom",
-                        attributes: ["id", "name"],
-                    },
-                ],
-            },
-            {
-                model: CompanyWarehouse,
-                as: "warehouse",
-                attributes: ["id", "name", "contact_person", "mobile", "phone_no", "email", "address"],
-            },
-            {
-                model: User,
-                as: "reversedByUser",
-                attributes: ["id", "name"],
-                required: false,
-            },
-            {
-                model: ChallanItems,
-                as: "items",
-                include: [
-                    {
-                        model: Product,
-                        as: "product",
-                        include: [
-                            {
-                                model: ProductType,
-                                as: "productType",
-                                attributes: ["id", "name"],
-                            },
-                            {
-                                model: MeasurementUnit,
-                                as: "measurementUnit",
-                                attributes: ["id", "unit"],
-                            },
-                        ],
-                    },
-                ],
-            },
-        ],
+        include,
     });
 
     return challan;
@@ -667,65 +797,396 @@ const getChallanById = async ({ id, transaction } = {}) => {
  */
 const getChallanForPdf = async ({ id } = {}) => {
     const models = getTenantModels();
-    const { Challan, ChallanItems, Order, CompanyWarehouse, Product, ProductType, MeasurementUnit, Customer, Quotation, User } = models;
+    const { Challan, ChallanItems, Order, CompanyWarehouse, Product, ProductType, MeasurementUnit, Customer, Quotation, User, B2BSalesOrder, B2BClient } = models;
+    const includePdf = [];
+    if (Order) {
+        includePdf.push({
+            model: Order,
+            as: "order",
+            attributes: ["id", "order_number", "consumer_no", "capacity", "handled_by"],
+            required: false,
+            include: [
+                {
+                    model: Customer,
+                    as: "customer",
+                    attributes: [
+                        "id",
+                        "customer_name",
+                        "mobile_number",
+                        "phone_no",
+                        "address",
+                        "landmark_area",
+                        "taluka",
+                        "district",
+                    ],
+                },
+                {
+                    model: User,
+                    as: "handledBy",
+                    attributes: ["id", "name"],
+                },
+            ],
+        });
+    }
+    if (B2BSalesOrder) {
+        includePdf.push({
+            model: B2BSalesOrder,
+            as: "b2bSalesOrder",
+            attributes: ["id", "order_no", "order_date", "status"],
+            required: false,
+            include: [
+                {
+                    model: B2BClient,
+                    as: "client",
+                    attributes: ["id", "client_name", "phone", "billing_address", "billing_city", "billing_district"],
+                },
+                { model: User, as: "user", attributes: ["id", "name"] },
+            ],
+        });
+    }
+    includePdf.push(
+        {
+            model: CompanyWarehouse,
+            as: "warehouse",
+            attributes: ["id", "name", "contact_person", "mobile", "phone_no", "email", "address"],
+        },
+        {
+            model: ChallanItems,
+            as: "items",
+            include: [
+                {
+                    model: Product,
+                    as: "product",
+                    attributes: ["id", "product_name", "product_description", "hsn_ssn_code"],
+                    include: [
+                        {
+                            model: MeasurementUnit,
+                            as: "measurementUnit",
+                            attributes: ["id", "unit"],
+                        },
+                    ],
+                },
+            ],
+        }
+    );
+
     const challan = await Challan.findOne({
         where: { id },
         paranoid: false,
-        include: [
-            {
-                model: Order,
-                as: "order",
-                attributes: ["id", "order_number", "consumer_no", "capacity", "handled_by"],
-                include: [
-                    {
-                        model: Customer,
-                        as: "customer",
-                        attributes: [
-                            "id",
-                            "customer_name",
-                            "mobile_number",
-                            "phone_no",
-                            "address",
-                            "landmark_area",
-                            "taluka",
-                            "district",
-                        ],
-                    },
-                    {
-                        model: User,
-                        as: "handledBy",
-                        attributes: ["id", "name"],
-                    },
-                ],
-            },
-            {
-                model: CompanyWarehouse,
-                as: "warehouse",
-                attributes: ["id", "name", "contact_person", "mobile", "phone_no", "email", "address"],
-            },
-            {
-                model: ChallanItems,
-                as: "items",
-                include: [
-                    {
-                        model: Product,
-                        as: "product",
-                        attributes: ["id", "product_name", "product_description", "hsn_ssn_code"],
-                        include: [
-                            {
-                                model: MeasurementUnit,
-                                as: "measurementUnit",
-                                attributes: ["id", "unit"],
-                            },
-                        ],
-                    },
-                ],
-            },
-        ],
+        include: includePdf,
         order: [[{ model: ChallanItems, as: "items" }, "id", "ASC"]],
     });
 
     return challan;
+};
+
+/**
+ * Create challan against a B2B sales order (OpsCore). Stock OUT uses DELIVERY_CHALLAN_OUT.
+ */
+const createChallanForB2b = async ({ items, challanData, user_id, transaction }) => {
+    const models = getTenantModels();
+    const {
+        Challan,
+        ChallanItems,
+        B2BSalesOrder,
+        B2BSalesOrderItem,
+        CompanyWarehouse,
+        User,
+        Product,
+        ProductType,
+        Stock,
+        StockSerial,
+        B2BShipment,
+        B2BShipmentItem,
+    } = models;
+
+    const b2bOrderId = Number(challanData.b2b_sales_order_id);
+    if (!b2bOrderId) {
+        const err = new Error("b2b_sales_order_id is required");
+        err.statusCode = 400;
+        throw err;
+    }
+
+    const b2bOrder = await B2BSalesOrder.findOne({
+        where: { id: b2bOrderId, deleted_at: null },
+        include: [{ model: B2BSalesOrderItem, as: "items" }],
+        transaction,
+    });
+    if (!b2bOrder) {
+        const err = new Error("B2B sales order not found");
+        err.statusCode = 404;
+        throw err;
+    }
+    if (String(b2bOrder.status) !== "CONFIRMED") {
+        const err = new Error("B2B sales order must be confirmed to create a delivery challan");
+        err.statusCode = 400;
+        throw err;
+    }
+
+    const plannedWarehouseId = b2bOrder.planned_warehouse_id;
+    if (!plannedWarehouseId) {
+        const err = new Error("Planned warehouse is not set for this order");
+        err.statusCode = 400;
+        throw err;
+    }
+    if (!user_id) {
+        const err = new Error("User context is required to create challan");
+        err.statusCode = 403;
+        throw err;
+    }
+
+    const warehouseWithManager = await CompanyWarehouse.findOne({
+        where: { id: plannedWarehouseId, deleted_at: null },
+        include: [{ model: User, as: "managers", attributes: ["id"], where: { id: user_id }, required: true }],
+        transaction,
+    });
+    if (!warehouseWithManager) {
+        const err = new Error("You are not a manager of the planned warehouse for this order");
+        err.statusCode = 403;
+        throw err;
+    }
+    if (challanData.warehouse_id && Number(challanData.warehouse_id) !== Number(plannedWarehouseId)) {
+        const err = new Error("Challan warehouse must match the order's planned warehouse");
+        err.statusCode = 400;
+        throw err;
+    }
+
+    const orderItemsByProduct = {};
+    (b2bOrder.items || []).forEach((oi) => {
+        orderItemsByProduct[oi.product_id] = oi;
+    });
+
+    const previousQtyByProduct = {};
+    const addPrev = (pid, q) => {
+        if (pid == null) return;
+        previousQtyByProduct[pid] = (previousQtyByProduct[pid] || 0) + q;
+    };
+
+    const previousChallans = await Challan.findAll({
+        where: { b2b_sales_order_id: b2bOrderId, deleted_at: null, is_reversed: false },
+        include: [{ model: ChallanItems, as: "items", attributes: ["product_id", "quantity"] }],
+        transaction,
+    });
+    previousChallans.forEach((c) => {
+        (c.items || []).forEach((it) => addPrev(it.product_id, parseFloat(it.quantity) || 0));
+    });
+
+    if (B2BShipment && B2BShipmentItem) {
+        const shipments = await B2BShipment.findAll({
+            where: { b2b_sales_order_id: b2bOrderId, deleted_at: null },
+            include: [{ model: B2BShipmentItem, as: "items" }],
+            transaction,
+        });
+        shipments.forEach((s) => {
+            (s.items || []).forEach((it) => addPrev(it.product_id, parseInt(it.quantity, 10) || 0));
+        });
+    }
+
+    const productIds = [...new Set(items.map((i) => i.product_id))];
+    const products = await Product.findAll({
+        where: { id: productIds, deleted_at: null },
+        include: [{ model: ProductType, as: "productType", attributes: ["id", "name"] }],
+        transaction,
+    });
+    const productMap = {};
+    products.forEach((p) => {
+        productMap[p.id] = p;
+    });
+
+    for (const item of items) {
+        const pid = item.product_id;
+        const oi = orderItemsByProduct[pid];
+        if (!oi) {
+            const err = new Error(`Product ${pid} is not on this B2B sales order`);
+            err.statusCode = 400;
+            throw err;
+        }
+        const ordered = parseInt(oi.quantity, 10) || 0;
+        const prev = previousQtyByProduct[pid] || 0;
+        const cur = parseFloat(item.quantity) || 0;
+        if (prev + cur > ordered) {
+            const err = new Error(`Total dispatch for product ${pid} (${prev + cur}) exceeds ordered (${ordered})`);
+            err.statusCode = 400;
+            throw err;
+        }
+    }
+
+    if (!challanData.challan_no) {
+        challanData.challan_no = await generateChallanNumber();
+    }
+
+    const challan = await Challan.create(
+        {
+            ...challanData,
+            order_id: null,
+            warehouse_id: plannedWarehouseId,
+            b2b_sales_order_id: b2bOrderId,
+        },
+        { transaction }
+    );
+
+    await ChallanItems.bulkCreate(
+        items.map((item) => ({
+            challan_id: challan.id,
+            product_id: item.product_id,
+            quantity: item.quantity,
+            serials: item.serials || null,
+            remarks: item.remarks,
+            b2b_sales_order_item_id:
+                item.b2b_sales_order_item_id != null
+                    ? item.b2b_sales_order_item_id
+                    : orderItemsByProduct[item.product_id]?.id ?? null,
+        })),
+        { transaction }
+    );
+
+    const transactionReferenceNo = b2bOrder.order_no;
+
+    for (const item of items) {
+        const qty = Number(item.quantity);
+        const product = productMap[item.product_id];
+        const productName = product?.product_name || `Product #${item.product_id}`;
+
+        if (!Number.isFinite(qty) || qty <= 0) {
+            const err = new Error(`Invalid quantity for ${productName}`);
+            err.statusCode = 400;
+            throw err;
+        }
+        if (!Number.isInteger(qty)) {
+            const err = new Error(`Quantity for ${productName} must be a whole number`);
+            err.statusCode = 400;
+            throw err;
+        }
+        if (!product) {
+            const err = new Error(`Product not found: ${productName}`);
+            err.statusCode = 404;
+            throw err;
+        }
+
+        const stock = await stockService.getOrCreateStock({
+            product_id: item.product_id,
+            warehouse_id: plannedWarehouseId,
+            product,
+            transaction,
+        });
+
+        if (stock.quantity_available < qty) {
+            const err = new Error(
+                `Insufficient stock for ${productName}. Available: ${stock.quantity_available}, Required: ${qty}`
+            );
+            err.statusCode = 400;
+            throw err;
+        }
+
+        const isSerialized = !!stock.serial_required || !!product.serial_required;
+        const serialsRaw = item.serials || "";
+        const serialList = serialsRaw
+            .split(",")
+            .map((s) => s.trim())
+            .filter((s) => s.length > 0);
+
+        if (isSerialized) {
+            if (serialList.length !== qty) {
+                const err = new Error(
+                    `Serial count (${serialList.length}) must match quantity (${qty}) for ${productName}`
+                );
+                err.statusCode = 400;
+                throw err;
+            }
+
+            for (const serial of serialList) {
+                const stockSerial = await StockSerial.findOne({
+                    where: {
+                        serial_number: { [Op.iLike]: serial },
+                        product_id: item.product_id,
+                        warehouse_id: plannedWarehouseId,
+                    },
+                    lock: transaction.LOCK.UPDATE,
+                    transaction,
+                });
+
+                if (!stockSerial) {
+                    const err = new Error(
+                        `Serial '${serial}' is not available at this warehouse for ${productName}`
+                    );
+                    err.statusCode = 400;
+                    throw err;
+                }
+
+                if (stockSerial.status !== SERIAL_STATUS.AVAILABLE) {
+                    const err = new Error(`Serial '${serial}' for ${productName} is not available`);
+                    err.statusCode = 400;
+                    throw err;
+                }
+
+                await stockSerial.update(
+                    {
+                        status: SERIAL_STATUS.ISSUED,
+                        outward_date: new Date(),
+                        source_type: TRANSACTION_TYPE.DELIVERY_CHALLAN_OUT,
+                        source_id: challan.id,
+                        issued_against: "b2b_sales_order",
+                        reference_number: transactionReferenceNo,
+                    },
+                    { transaction }
+                );
+
+                await inventoryLedgerService.createLedgerEntry({
+                    product_id: item.product_id,
+                    warehouse_id: plannedWarehouseId,
+                    stock_id: stock.id,
+                    transaction_type: TRANSACTION_TYPE.DELIVERY_CHALLAN_OUT,
+                    transaction_id: challan.id,
+                    transaction_reference_no: transactionReferenceNo,
+                    movement_type: MOVEMENT_TYPE.OUT,
+                    quantity: 1,
+                    serial_id: stockSerial.id,
+                    rate: null,
+                    gst_percent: null,
+                    amount: null,
+                    reason: `Delivery challan ${challan.challan_no}`,
+                    performed_by: user_id,
+                    transaction,
+                });
+            }
+        } else {
+            await inventoryLedgerService.createLedgerEntry({
+                product_id: item.product_id,
+                warehouse_id: plannedWarehouseId,
+                stock_id: stock.id,
+                transaction_type: TRANSACTION_TYPE.DELIVERY_CHALLAN_OUT,
+                transaction_id: challan.id,
+                transaction_reference_no: transactionReferenceNo,
+                movement_type: MOVEMENT_TYPE.OUT,
+                quantity: qty,
+                rate: null,
+                gst_percent: null,
+                amount: null,
+                reason: `Delivery challan ${challan.challan_no}`,
+                performed_by: user_id,
+                transaction,
+            });
+        }
+
+        await stockService.updateStockQuantities({
+            stock,
+            quantity: qty,
+            last_updated_by: user_id,
+            isInward: false,
+            transaction,
+        });
+    }
+
+    for (const item of items) {
+        const oi = orderItemsByProduct[item.product_id];
+        if (oi) {
+            const curShipped = parseInt(oi.shipped_quantity, 10) || 0;
+            const addQtyItem = parseInt(item.quantity, 10) || 0;
+            await oi.update({ shipped_quantity: curShipped + addQtyItem }, { transaction });
+        }
+    }
+
+    return getChallanById({ id: challan.id, transaction });
 };
 
 /**
@@ -739,6 +1200,16 @@ const createChallan = async ({ payload, user_id, transaction } = {}) => {
     // Validate minimum one item
     if (!items || items.length === 0) {
         const error = new Error("At least one item is required");
+        error.statusCode = 400;
+        throw error;
+    }
+
+    if (challanData.b2b_sales_order_id) {
+        return createChallanForB2b({ items, challanData, user_id, transaction });
+    }
+
+    if (!Order) {
+        const error = new Error("b2b_sales_order_id is required to create a delivery challan");
         error.statusCode = 400;
         throw error;
     }
@@ -1238,11 +1709,21 @@ const deleteChallan = async ({ id, user_id, transaction, ledgerReason = null, ma
         const productMap = {};
         products.forEach((p) => { productMap[p.id] = p; });
 
-        const orderForRef = await Order.findByPk(challan.order_id, {
-            transaction,
-            attributes: ["order_number"],
-        });
-        const transactionReferenceNo = orderForRef?.order_number ?? null;
+        const { B2BSalesOrder } = models;
+        let transactionReferenceNo = null;
+        if (challan.b2b_sales_order_id && B2BSalesOrder) {
+            const so = await B2BSalesOrder.findByPk(challan.b2b_sales_order_id, {
+                transaction,
+                attributes: ["order_no"],
+            });
+            transactionReferenceNo = so?.order_no ?? null;
+        } else if (Order && challan.order_id) {
+            const orderForRef = await Order.findByPk(challan.order_id, {
+                transaction,
+                attributes: ["order_number"],
+            });
+            transactionReferenceNo = orderForRef?.order_number ?? null;
+        }
 
         for (const item of challan.items) {
             const qty = Number(item.quantity);
@@ -1361,6 +1842,19 @@ const deleteChallan = async ({ id, user_id, transaction, ledgerReason = null, ma
         }
     }
 
+    if (challan.b2b_sales_order_id) {
+        const { B2BSalesOrderItem } = models;
+        for (const item of challan.items || []) {
+            const oiId = item.b2b_sales_order_item_id;
+            if (!oiId) continue;
+            const oi = await B2BSalesOrderItem.findByPk(oiId, { transaction });
+            if (!oi) continue;
+            const dec = parseInt(item.quantity, 10) || 0;
+            const cur = parseInt(oi.shipped_quantity, 10) || 0;
+            await oi.update({ shipped_quantity: Math.max(0, cur - dec) }, { transaction });
+        }
+    }
+
     if (markReversed) {
         await challan.update(
             {
@@ -1420,7 +1914,7 @@ const reverseChallan = async ({
     // Fetch order from challan for stage validation.
     const challanRow = await Challan.findOne({
         where: { id, deleted_at: null },
-        attributes: ["id", "order_id"],
+        attributes: ["id", "order_id", "b2b_sales_order_id"],
         transaction,
     });
 
@@ -1430,17 +1924,19 @@ const reverseChallan = async ({
         throw error;
     }
 
-    const orderRow = await Order.findOne({
-        where: { id: challanRow.order_id, deleted_at: null },
-        attributes: ["current_stage_key"],
-        transaction,
-    });
+    if (Order && challanRow.order_id) {
+        const orderRow = await Order.findOne({
+            where: { id: challanRow.order_id, deleted_at: null },
+            attributes: ["current_stage_key"],
+            transaction,
+        });
 
-    const currentStageKey = String(orderRow?.current_stage_key || "").toLowerCase();
-    if (!ALLOWED_STAGE_KEYS.has(currentStageKey)) {
-        const error = new Error("Reverse not allowed for this order stage");
-        error.statusCode = 400;
-        throw error;
+        const currentStageKey = String(orderRow?.current_stage_key || "").toLowerCase();
+        if (!ALLOWED_STAGE_KEYS.has(currentStageKey)) {
+            const error = new Error("Reverse not allowed for this order stage");
+            error.statusCode = 400;
+            throw error;
+        }
     }
 
     const roleRow = await Role.findOne({
@@ -1495,7 +1991,31 @@ const getNextChallanNumber = async () => {
  */
 const getQuotationProductsByOrderId = async ({ order_id } = {}) => {
     const models = getTenantModels();
-    const { Order, Quotation, Product, ProductType } = models;
+    const { Order, Quotation, Product, ProductType, B2BSalesOrder, B2BSalesOrderItem } = models;
+
+    if (!Order && B2BSalesOrder) {
+        const b2bOrder = await B2BSalesOrder.findOne({
+            where: { id: order_id, deleted_at: null },
+            include: [{ model: B2BSalesOrderItem, as: "items" }],
+        });
+        if (!b2bOrder) {
+            throw new Error("Order not found");
+        }
+        const productIds = [...new Set((b2bOrder.items || []).map((line) => line.product_id).filter((pid) => pid != null))];
+        if (productIds.length === 0) {
+            return { products: [] };
+        }
+        const products = await Product.findAll({
+            where: { id: productIds, deleted_at: null },
+            include: [{ model: ProductType, as: "productType", attributes: ["id", "name"] }],
+        });
+        return { products };
+    }
+
+    if (!Order) {
+        throw new Error("Order not found");
+    }
+
     const order = await Order.findOne({
         where: { id: order_id, deleted_at: null },
         attributes: ["id", "bom_snapshot"],
@@ -1572,6 +2092,41 @@ const getQuotationProductsByOrderId = async ({ order_id } = {}) => {
 const getDeliveryStatus = async ({ order_id } = {}) => {
     const models = getTenantModels();
     const { Order, Quotation, Challan, ChallanItems, Product, ProductType } = models;
+
+    if (!Order) {
+        const b2bSalesOrdersService = require("../b2bSalesOrders/b2bSalesOrders.service.js");
+        const b2bOrder = await b2bSalesOrdersService.getOrderById({ id: order_id });
+        if (!b2bOrder) {
+            throw new Error("Order not found");
+        }
+        const status = {};
+        const norm = (s) => (s || "").toLowerCase().replace(/\s+/g, "_");
+        (b2bOrder.items || []).forEach((it) => {
+            const p = it.product;
+            const typeKey = norm(p?.productType?.name || "item");
+            const required = Number(it.ordered_qty ?? it.quantity) || 0;
+            const delivered = Number(it.shipped_qty) || 0;
+            const pending = Number(it.pending_qty) || Math.max(0, required - delivered);
+            if (!status[typeKey]) {
+                status[typeKey] = { required: 0, delivered: 0, pending: 0, status: "pending" };
+            }
+            status[typeKey].required += required;
+            status[typeKey].delivered += delivered;
+            status[typeKey].pending += pending;
+        });
+        Object.keys(status).forEach((key) => {
+            const entry = status[key];
+            if (entry.delivered >= entry.required && entry.required > 0) {
+                entry.status = "complete";
+            } else if (entry.delivered > 0) {
+                entry.status = "partial";
+            } else {
+                entry.status = "pending";
+            }
+        });
+        return { status };
+    }
+
     const order = await Order.findOne({
         where: { id: order_id, deleted_at: null },
         attributes: ["id", "bom_snapshot"],

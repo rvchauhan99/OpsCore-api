@@ -13,11 +13,11 @@ module.exports = {
     if (!adminRole)
       throw new Error("Admin role not found. Please seed roles first.");
 
-    // Check if users already exist
+    // Any row with this email blocks inserts: table-level UNIQUE(email) still applies to soft-deleted rows.
     const [existingUsers] = await queryInterface.sequelize.query(
-      `SELECT email FROM users WHERE deleted_at IS NULL`
+      `SELECT LOWER(TRIM(email)) AS email FROM users WHERE email IS NOT NULL`
     );
-    const existingEmails = existingUsers.map((u) => u.email);
+    const existingEmails = new Set(existingUsers.map((u) => String(u.email)));
 
     const hashedPassword = await bcrypt.hash("Admin@123", 10);
     const now = new Date();
@@ -49,7 +49,7 @@ module.exports = {
         updated_at: now,
         deleted_at: null,
       },
-    ].filter((user) => !existingEmails.includes(user.email));
+    ].filter((user) => !existingEmails.has(String(user.email).toLowerCase().trim()));
 
     if (usersToInsert.length > 0) {
       await queryInterface.bulkInsert("users", usersToInsert);

@@ -33,6 +33,8 @@ const Product = sequelize.define(
       references: { model: "product_makes", key: "id" },
     },
     product_name: { type: DataTypes.STRING, allowNull: false },
+    category: { type: DataTypes.STRING(120), allowNull: true },
+    subcategory: { type: DataTypes.STRING(120), allowNull: true },
     product_description: { type: DataTypes.TEXT, allowNull: true },
     hsn_ssn_code: { type: DataTypes.STRING, allowNull: true },
     measurement_unit_id: {

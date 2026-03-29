@@ -10,6 +10,11 @@ exports.getById = asyncHandler(async (req, res) => {
   const item = await service.getById(req.params.id, req);
   res.json({ status: true, data: item });
 });
+exports.createFromB2b = asyncHandler(async (req, res) => {
+  const result = await service.createFromB2bSalesOrder(req.params.salesOrderId, req.body, req);
+  res.status(201).json({ status: true, ...result, message: "Manufacturing orders created from sales order" });
+});
+
 exports.create = asyncHandler(async (req, res) => {
   const item = await service.create(req.body, req);
   res.status(201).json({ status: true, data: item, message: "Manufacturing Order created" });

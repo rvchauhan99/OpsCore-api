@@ -17,7 +17,7 @@ const listTemplates = async (req) => {
 
   const rows = await QcTemplate.findAll({
     where,
-    include: [{ model: Product, as: "product", attributes: ["id", "name"], required: false }],
+    include: [{ model: Product, as: "product", attributes: ["id", "product_name"], required: false }],
     order: [["name", "ASC"]],
   });
   return rows;

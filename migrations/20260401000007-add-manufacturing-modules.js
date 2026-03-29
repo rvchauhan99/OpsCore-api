@@ -1,114 +1,65 @@
 "use strict";
 
+const { QueryTypes } = require("sequelize");
+
 /**
- * Adds all OpsCore Manufacturing-specific modules to the module_masters table.
- * These modules enable RBAC for: BOM, Work Centers, Manufacturing Orders, Work Orders,
- * Quality Control, Cost Sheets, and Production Schedule.
+ * Adds OpsCore Manufacturing modules to `modules` (same shape as other module migrations).
  */
 module.exports = {
   async up(queryInterface) {
-    const { QueryTypes } = require("sequelize");
     const sequelize = queryInterface.sequelize;
 
-    // Fetch existing module routes to avoid duplicates
-    const existing = await sequelize.query(
-      "SELECT route FROM modules WHERE route IN (:routes)",
-      {
-        replacements: {
-          routes: [
-            "/bill-of-materials",
-            "/work-centers",
-            "/manufacturing-orders",
-            "/work-orders",
-            "/quality-control",
-            "/cost-sheet",
-          ],
-        },
-        type: QueryTypes.SELECT,
-      }
-    );
-    const existingRoutes = new Set(existing.map((r) => r.route));
-
-    const now = new Date();
-    const modules = [
-      {
-        name: "Bill of Materials",
-        route: "/bill-of-materials",
-        icon: "IconAssembly",
-        group: "Manufacturing",
-        display_order: 100,
-        authorize_with_params: false,
-        created_at: now,
-        updated_at: now,
-      },
-      {
-        name: "Work Centers",
-        route: "/work-centers",
-        icon: "IconBuildingFactory2",
-        group: "Manufacturing",
-        display_order: 101,
-        authorize_with_params: false,
-        created_at: now,
-        updated_at: now,
-      },
-      {
-        name: "Manufacturing Orders",
-        route: "/manufacturing-orders",
-        icon: "IconClipboardList",
-        group: "Manufacturing",
-        display_order: 102,
-        authorize_with_params: false,
-        created_at: now,
-        updated_at: now,
-      },
-      {
-        name: "Work Orders",
-        route: "/work-orders",
-        icon: "IconTools",
-        group: "Manufacturing",
-        display_order: 103,
-        authorize_with_params: false,
-        created_at: now,
-        updated_at: now,
-      },
-      {
-        name: "Quality Control",
-        route: "/quality-control",
-        icon: "IconShieldCheck",
-        group: "Manufacturing",
-        display_order: 104,
-        authorize_with_params: false,
-        created_at: now,
-        updated_at: now,
-      },
-      {
-        name: "Cost Sheet",
-        route: "/cost-sheet",
-        icon: "IconCalculator",
-        group: "Manufacturing",
-        display_order: 105,
-        authorize_with_params: false,
-        created_at: now,
-        updated_at: now,
-      },
+    const specs = [
+      { name: "Bill of Materials", key: "bill_of_materials", route: "/bill-of-materials", icon: "assembly" },
+      { name: "Work Centers", key: "work_centers", route: "/work-centers", icon: "factory" },
+      { name: "Manufacturing Orders", key: "manufacturing_orders", route: "/manufacturing-orders", icon: "clipboard" },
+      { name: "Work Orders", key: "work_orders", route: "/work-orders", icon: "tools" },
+      { name: "Quality Control", key: "quality_control", route: "/quality-control", icon: "shield" },
+      { name: "Cost Sheet", key: "cost_sheet", route: "/cost-sheet", icon: "calculator" },
     ];
 
-    const toInsert = modules.filter((m) => !existingRoutes.has(m.route));
-    if (toInsert.length > 0) {
-      await queryInterface.bulkInsert("modules", toInsert);
+    for (const s of specs) {
+      const existing = await sequelize.query(
+        `SELECT id FROM modules WHERE key = :key AND deleted_at IS NULL LIMIT 1`,
+        { replacements: { key: s.key }, type: QueryTypes.SELECT }
+      );
+      if (existing && existing.length > 0) continue;
+
+      const [{ max_seq }] = await sequelize.query(
+        `SELECT COALESCE(MAX(sequence), 0) AS max_seq FROM modules WHERE deleted_at IS NULL`,
+        { type: QueryTypes.SELECT }
+      );
+      const seq = (parseInt(max_seq, 10) || 0) + 1;
+
+      await sequelize.query(
+        `INSERT INTO modules (name, key, parent_id, icon, route, sequence, status, authorize_with_params, created_at, updated_at)
+         VALUES (:name, :key, NULL, :icon, :route, :seq, 'active', false, NOW(), NOW())`,
+        {
+          replacements: {
+            name: s.name,
+            key: s.key,
+            icon: s.icon,
+            route: s.route,
+            seq,
+          },
+        }
+      );
     }
   },
 
   async down(queryInterface) {
-    await queryInterface.bulkDelete("modules", {
-      route: [
-        "/bill-of-materials",
-        "/work-centers",
-        "/manufacturing-orders",
-        "/work-orders",
-        "/quality-control",
-        "/cost-sheet",
-      ],
-    });
+    const keys = [
+      "bill_of_materials",
+      "work_centers",
+      "manufacturing_orders",
+      "work_orders",
+      "quality_control",
+      "cost_sheet",
+    ];
+    const literal = keys.map((k) => `'${String(k).replace(/'/g, "''")}'`).join(",");
+    await queryInterface.sequelize.query(
+      `UPDATE modules SET deleted_at = NOW(), updated_at = NOW()
+       WHERE key IN (${literal}) AND deleted_at IS NULL`
+    );
   },
 };

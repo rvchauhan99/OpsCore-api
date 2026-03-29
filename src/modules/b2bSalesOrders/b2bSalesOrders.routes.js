@@ -6,6 +6,7 @@ const controller = require("./b2bSalesOrders.controller.js");
 const router = Router();
 
 router.get("/next-number", controller.getNextNumber);
+router.get("/pending-delivery", controller.listPendingDelivery);
 router.post("/from-quote/:quoteId", controller.createFromQuote);
 router.get("/:orderId/items-for-shipment", controller.getItemsForShipment);
 router.get("/", controller.list);

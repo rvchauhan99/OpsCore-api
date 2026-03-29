@@ -54,6 +54,8 @@ const bomRoutes = require("../modules/bom/bom.routes.js");
 const manufacturingOrderRoutes = require("../modules/manufacturingOrder/manufacturingOrder.routes.js");
 const workOrderRoutes = require("../modules/workOrder/workOrder.routes.js");
 const qualityControlRoutes = require("../modules/qualityControl/qualityControl.routes.js");
+const productionScheduleRoutes = require("../modules/productionSchedule/productionSchedule.routes.js");
+const financeReportsRoutes = require("../modules/financeReports/financeReports.routes.js");
 
 const router = Router();
 
@@ -247,6 +249,18 @@ router.use(
   requireAuthWithTenant,
   requireModulePermissionByMethod({ moduleRoute: "/quality-control" }),
   qualityControlRoutes
+);
+router.use(
+  "/production-schedule",
+  requireAuthWithTenant,
+  requireModulePermissionByMethod({ moduleRoute: "/production-schedule" }),
+  productionScheduleRoutes
+);
+router.use(
+  "/finance",
+  requireAuthWithTenant,
+  requireModulePermissionByMethod({ moduleRoute: "/finance" }),
+  financeReportsRoutes
 );
 
 router.get("/", (req, res) => res.send("OpsCore API Running ✅"));

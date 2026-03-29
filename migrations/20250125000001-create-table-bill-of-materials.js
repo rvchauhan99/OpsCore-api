@@ -1,5 +1,7 @@
 "use strict";
 
+/** Legacy solar-era BOM table. Superseded by `bom_headers` / `bom_components` / `bom_routings`. May be dropped when empty (see plan-backlog migration). */
+
 module.exports = {
   async up(queryInterface, Sequelize) {
     await queryInterface.createTable("bill_of_materials", {

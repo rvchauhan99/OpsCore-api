@@ -103,7 +103,7 @@ const list = async (req) => {
   const { count, rows } = await BomHeader.findAndCountAll({
     where,
     include: [
-      { model: Product, as: "product", attributes: ["id", "name", "sku"] },
+      { model: Product, as: "product", attributes: ["id", "product_name", "barcode_number"] },
       { model: CostSheet, as: "costSheet", required: false },
     ],
     order: [["created_at", "DESC"]],
@@ -122,11 +122,11 @@ const getById = async (id, req) => {
   const bom = await BomHeader.findOne({
     where,
     include: [
-      { model: Product, as: "product", attributes: ["id", "name", "sku"] },
+      { model: Product, as: "product", attributes: ["id", "product_name", "barcode_number"] },
       {
         model: BomComponent,
         as: "components",
-        include: [{ model: Product, as: "componentProduct", attributes: ["id", "name", "sku"] }],
+        include: [{ model: Product, as: "componentProduct", attributes: ["id", "product_name", "barcode_number"] }],
         order: [["sequence_no", "ASC"]],
       },
       {

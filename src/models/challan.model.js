@@ -44,7 +44,12 @@ const Challan = sequelize.define(
 
         order_id: {
             type: DataTypes.BIGINT,
-            allowNull: false,
+            allowNull: true,
+        },
+
+        b2b_sales_order_id: {
+            type: DataTypes.INTEGER,
+            allowNull: true,
         },
 
         warehouse_id: {

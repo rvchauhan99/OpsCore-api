@@ -30,7 +30,7 @@ const list = async (req) => {
         model: ManufacturingOrder,
         as: "manufacturingOrder",
         attributes: ["id", "mo_number", "status"],
-        include: [{ model: db.Product, as: "product", attributes: ["id", "name"] }],
+        include: [{ model: db.Product, as: "product", attributes: ["id", "product_name", "barcode_number"] }],
       },
       { model: WorkCenter, as: "workCenter", attributes: ["id", "name", "code"] },
       { model: BomRouting, as: "routingStep", attributes: ["id", "step_name", "sequence_no"] },
@@ -54,7 +54,7 @@ const getById = async (id, req) => {
       {
         model: ManufacturingOrder,
         as: "manufacturingOrder",
-        include: [{ model: db.Product, as: "product", attributes: ["id", "name"] }],
+        include: [{ model: db.Product, as: "product", attributes: ["id", "product_name", "barcode_number"] }],
       },
       { model: WorkCenter, as: "workCenter" },
       { model: BomRouting, as: "routingStep" },
