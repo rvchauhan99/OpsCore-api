@@ -1,0 +1,1071 @@
+#!/usr/bin/env node
+"use strict";
+
+/**
+ * Order Import Script – Go Live Migration
+ *
+ * Imports orders from CSV files. No documents, images, or challans.
+ * Usage:
+ *   node scripts/order-import/import-orders.js --file open-orders.csv
+ *   node scripts/order-import/import-orders.js --file completed-orders.csv --dry-run
+ *   node scripts/order-import/import-orders.js --file open.csv --file completed.csv
+ *
+ * By default, rows whose order_number already exists in the database are skipped (no update, no touch).
+ * Use --update-existing to upsert existing orders from CSV (previous behavior).
+ */
+
+const path = require("path");
+const fs = require("fs");
+const { parse } = require("csv-parse/sync");
+const { Op } = require("sequelize");
+const ExcelJS = require("exceljs");
+
+require("dotenv").config({ path: path.join(__dirname, "..", "..", ".env") });
+
+const db = require("../../src/models/index.js");
+const orderService = require("../../src/modules/order/order.service.js");
+
+const {
+    Order,
+    Customer,
+    User,
+    Product,
+    InquirySource,
+    ProjectScheme,
+    OrderType,
+    Discom,
+    CompanyBranch,
+    CompanyWarehouse,
+    State,
+    City,
+    Division,
+    SubDivision,
+} = db;
+
+/** Process rows in batches of this size; one transaction per batch. */
+const BATCH_SIZE = 100;
+/** Max concurrent batches when parallel batch processing is enabled (0 = sequential). */
+const PARALLEL_BATCH_CONCURRENCY = 2;
+
+const STAGE_ORDER = [
+    "estimate_generated",
+    "estimate_paid",
+    "planner",
+    "delivery",
+    "assign_fabricator_and_installer",
+    "fabrication",
+    "installation",
+    "netmeter_apply",
+    "netmeter_installed",
+    "subsidy_claim",
+    "subsidy_disbursed",
+];
+
+/** Sentinel value for current_stage_key when the order is fully closed (all stages done). Not part of pipeline progression. */
+const ORDER_COMPLETED_STAGE_KEY = "order_completed";
+
+function inferStagesFromCurrentStage(currentStageKey, allCompleted = false) {
+    const stages = {};
+    const key = String(currentStageKey || "").trim().toLowerCase();
+    const isCompletedSentinel = key === "order_completed" || key === "completed";
+    if (allCompleted || isCompletedSentinel) {
+        STAGE_ORDER.forEach((k) => { stages[k] = "completed"; });
+        return stages;
+    }
+    const idx = key ? STAGE_ORDER.indexOf(currentStageKey.trim()) : -1;
+    STAGE_ORDER.forEach((k, i) => {
+        if (i < idx) stages[k] = "completed";
+        else if (i === idx) stages[k] = "pending";
+        else stages[k] = "locked";
+    });
+    return Object.keys(stages).length ? stages : null;
+}
+
+/** True if this row should be treated as a completed order (all stages → "completed", status "completed", current_stage_key "order_completed"). */
+function isRowCompleted(row, fileStatus, currentStageKey) {
+    if (fileStatus === "completed") return true;
+    const key = String(currentStageKey || "").trim().toLowerCase();
+    if (key === "completed" || key === "order_completed") return true;
+    const rowStatus = trim(row.status || row.order_status || "").toLowerCase();
+    if (rowStatus === "completed") return true;
+    return false;
+}
+
+function trim(s) {
+    return typeof s === "string" ? s.trim() : (s == null ? "" : String(s));
+}
+
+// Some CSV exports include UTF-8 BOM at the start of the first header column.
+// Example: header becomes "\ufefforder_number" instead of "order_number".
+const ORDER_NUMBER_BOM_KEY = "\ufefforder_number";
+function getOrderNumberFromRow(row) {
+    if (!row || typeof row !== "object") return undefined;
+    const direct = row.order_number;
+    if (direct != null && trim(direct) !== "") return direct;
+
+    const bom = row[ORDER_NUMBER_BOM_KEY];
+    if (bom != null && trim(bom) !== "") return bom;
+
+    // Fallback for unexpected header variants like "Order Number" or stray whitespace/BOM.
+    for (const k of Object.keys(row)) {
+        const normalizedKey = String(k)
+            .replace(/\ufeff/g, "")
+            .trim()
+            .toLowerCase()
+            .replace(/\s+/g, "_");
+        if (normalizedKey === "order_number") {
+            const v = row[k];
+            if (v != null && trim(v) !== "") return v;
+        }
+    }
+
+    return undefined;
+}
+
+function parseBool(v) {
+    const s = String(v || "").toLowerCase().trim();
+    return s === "true" || s === "1" || s === "yes";
+}
+
+function parseDate(v) {
+    const s = trim(v);
+    if (!s) return null;
+    // Handle common CSV/Excel formats explicitly (JS `new Date()` is inconsistent for `DD.MM.YYYY`).
+    // Examples:
+    // - 31.12.2025
+    // - 08-05.2025
+    // - 01/12/2025
+    // - 02/07/25
+    const dot = s.match(/^(\d{1,2})\.(\d{1,2})\.(\d{2}|\d{4})$/);
+    const dash = s.match(/^(\d{1,2})-(\d{1,2})\.(\d{2}|\d{4})$/); // e.g. 08-05.2025
+    const slash = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2}|\d{4})$/);
+
+    const pick = dot || dash || slash;
+    if (pick) {
+        const day = Number(pick[1]);
+        const month = Number(pick[2]);
+        let year = Number(pick[3]);
+        if (year < 100) year += 2000; // treat `25` as 2025
+
+        // Use UTC to avoid timezone shifting of the date portion.
+        const d = new Date(Date.UTC(year, month - 1, day));
+        return isNaN(d.getTime()) ? null : d.toISOString().slice(0, 10);
+    }
+
+    // Fallback: ISO/other formats that Date can parse reliably.
+    const d = new Date(s);
+    return isNaN(d.getTime()) ? null : d.toISOString().slice(0, 10);
+}
+
+/** Strip commas (and spaces) from numeric strings so "1,38,000" parses as 138000. */
+function normalizeDecimalString(v) {
+    if (v == null) return "";
+    return String(v).trim().replace(/,/g, "");
+}
+
+function parseFloatSafe(v) {
+    const s = normalizeDecimalString(v);
+    if (!s) return null;
+    const n = parseFloat(s);
+    return Number.isFinite(n) ? n : null;
+}
+
+function parseFloatSafeOrZero(v) {
+    const s = normalizeDecimalString(v);
+    if (s === "") return 0;
+    const n = parseFloat(s);
+    return Number.isFinite(n) ? n : 0;
+}
+
+function parseIntegerSafe(v) {
+    const n = parseInt(v, 10);
+    return Number.isInteger(n) ? n : null;
+}
+
+/** Normalize CSV row: map headers with spaces to snake_case for consistent access. */
+function normalizeCsvRow(row) {
+    if (row["Application No"] !== undefined) row.application_no = row.application_no ?? row["Application No"];
+    if (row["Registration Date"] !== undefined) row.registration_date = row.registration_date ?? row["Registration Date"];
+    if (row["Payment Type"] !== undefined) row.payment_type = row.payment_type ?? row["Payment Type"];
+    if (row["Status"] !== undefined) row.status = row.status ?? row["Status"];
+    if (row["Order Status"] !== undefined) row.order_status = row.order_status ?? row["Order Status"];
+
+    // Normalize possible UTF-8 BOM header.
+    if (
+        row[ORDER_NUMBER_BOM_KEY] != null &&
+        (row.order_number == null || (typeof row.order_number === "string" && row.order_number.trim() === ""))
+    ) {
+        row.order_number = row[ORDER_NUMBER_BOM_KEY];
+        delete row[ORDER_NUMBER_BOM_KEY];
+    }
+}
+
+async function resolveReferences() {
+    const [
+        inquirySources,
+        projectSchemes,
+        orderTypes,
+        discoms,
+        branches,
+        warehouses,
+        states,
+        cities,
+        divisions,
+        subDivisions,
+        users,
+        products,
+    ] = await Promise.all([
+        InquirySource.findAll({ where: { deleted_at: null }, attributes: ["id", "source_name"] }),
+        ProjectScheme.findAll({ where: { deleted_at: null }, attributes: ["id", "name"] }),
+        OrderType.findAll({ where: { deleted_at: null }, attributes: ["id", "name"] }),
+        Discom.findAll({ where: { deleted_at: null }, attributes: ["id", "name", "name_value"] }),
+        CompanyBranch.findAll({ where: { deleted_at: null }, attributes: ["id", "name"] }),
+        CompanyWarehouse.findAll({ where: { deleted_at: null }, attributes: ["id", "name"] }),
+        State.findAll({ where: { deleted_at: null }, attributes: ["id", "name"] }),
+        City.findAll({ where: { deleted_at: null }, attributes: ["id", "name", "state_id"] }),
+        Division.findAll({ where: { deleted_at: null }, attributes: ["id", "name"] }),
+        SubDivision.findAll({ where: { deleted_at: null }, attributes: ["id", "name", "division_id"] }),
+        User.findAll({ where: { deleted_at: null }, attributes: ["id", "email", "name"] }),
+        Product.findAll({ where: { deleted_at: null }, attributes: ["id", "product_name"] }),
+    ]);
+
+    const byName = (arr, key) => {
+        const m = new Map();
+        arr.forEach((r) => {
+            const n = (r[key] || "").toString().toLowerCase().trim();
+            if (n && !m.has(n)) m.set(n, r.id);
+        });
+        return m;
+    };
+
+    /** Map for discom lookup by name OR name_value (case-insensitive). CSV discom_name may match either. */
+    const byDiscomNameOrNameValue = (arr) => {
+        const m = new Map();
+        arr.forEach((r) => {
+            const name = (r.name || "").toString().toLowerCase().trim();
+            const nameValue = (r.name_value || "").toString().toLowerCase().trim();
+            if (name && !m.has(name)) m.set(name, r.id);
+            if (nameValue && !m.has(nameValue)) m.set(nameValue, r.id);
+        });
+        return m;
+    };
+
+    /** Map for user lookup by email OR name (case-insensitive). CSV fields may contain either. */
+    const byEmailOrName = () => {
+        const m = new Map();
+        users.forEach((r) => {
+            const e = (r.email || "").toString().toLowerCase().trim();
+            const n = (r.name || "").toString().toLowerCase().trim();
+            if (e && !m.has(e)) m.set(e, r.id);
+            if (n && !m.has(n)) m.set(n, r.id);
+        });
+        return m;
+    };
+
+    /** City lookup: key = "stateId|cityNameLower" or "cityNameLower" (when state unknown). O(1) per row. */
+    const cityByStateAndName = new Map();
+    cities.forEach((c) => {
+        const name = (c.name || "").toString().toLowerCase().trim();
+        if (!name) return;
+        const key = c.state_id ? `${c.state_id}|${name}` : `|${name}`;
+        if (!cityByStateAndName.has(key)) cityByStateAndName.set(key, c.id);
+        if (!cityByStateAndName.has(`|${name}`)) cityByStateAndName.set(`|${name}`, c.id);
+    });
+
+    /** SubDivision lookup: key = "divisionId|subDivisionNameLower". O(1) per row. */
+    const subDivisionByDivisionAndName = new Map();
+    subDivisions.forEach((s) => {
+        const name = (s.name || "").toString().toLowerCase().trim();
+        if (name && s.division_id) {
+            const key = `${s.division_id}|${name}`;
+            if (!subDivisionByDivisionAndName.has(key)) subDivisionByDivisionAndName.set(key, s.id);
+        }
+    });
+
+    /** Default inquiry_source_id when CSV has no inquiry_source_name: source_name === 'individual' (case-insensitive). */
+    const defaultInquirySourceId =
+        inquirySources.find((s) => (s.source_name || "").toString().toLowerCase().trim() === "individual")?.id ?? null;
+
+    return {
+        inquirySource: byName(inquirySources, "source_name"),
+        defaultInquirySourceId,
+        projectScheme: byName(projectSchemes, "name"),
+        orderType: byName(orderTypes, "name"),
+        discom: byDiscomNameOrNameValue(discoms),
+        branch: byName(branches, "name"),
+        warehouse: byName(warehouses, "name"),
+        state: byName(states, "name"),
+        city: cityByStateAndName,
+        division: byName(divisions, "name"),
+        subDivision: subDivisionByDivisionAndName,
+        userByEmail: byEmailOrName(),
+        productByName: byName(products, "product_name"),
+        _raw: { inquirySources, projectSchemes, orderTypes, discoms, branches, warehouses, states, cities, divisions, subDivisions, users, products },
+    };
+}
+
+/** Load existing orders by order_number for the given list; returns Map<order_number, Order>. */
+async function loadExistingOrdersByNumber(orderNumbers) {
+    if (!orderNumbers || orderNumbers.length === 0) return new Map();
+    const unique = [...new Set(orderNumbers.filter(Boolean))];
+    const orders = await Order.findAll({
+        where: { order_number: { [Op.in]: unique }, deleted_at: null },
+        attributes: ["id", "order_number"],
+        raw: true,
+    });
+    const map = new Map();
+    orders.forEach((o) => map.set(o.order_number, o));
+    return map;
+}
+
+/** Pre-load existing customers for batch rows; returns Map<cacheKey, customerId>. Reduces per-row Customer.findOne. */
+async function preloadCustomersForBatch(rows) {
+    const mobiles = new Set();
+    const names = new Set();
+    rows.forEach((r) => {
+        const m = trim(r.mobile_number);
+        const n = trim(r.customer_name);
+        if (m) mobiles.add(m);
+        if (n) names.add(n);
+    });
+    if (mobiles.size === 0 && names.size === 0) return new Map();
+    const where = {
+        deleted_at: null,
+        [Op.or]: [],
+    };
+    if (mobiles.size) where[Op.or].push({ mobile_number: { [Op.in]: [...mobiles] } });
+    if (names.size) where[Op.or].push({ customer_name: { [Op.in]: [...names] } });
+    const customers = await Customer.findAll({
+        where,
+        attributes: ["id", "mobile_number", "customer_name"],
+        raw: true,
+    });
+    const cache = new Map();
+    customers.forEach((c) => {
+        const m = (c.mobile_number || "").trim();
+        const n = (c.customer_name || "").trim();
+        const key = `${m}|${n}`;
+        if (!cache.has(key)) cache.set(key, c.id);
+        if (m && !cache.has(`${m}|`)) cache.set(`${m}|`, c.id);
+        if (n && !cache.has(`|${n}`)) cache.set(`|${n}`, c.id);
+    });
+    return cache;
+}
+
+function resolveRowReferences(row, refs) {
+    const errs = [];
+    const get = (map, val, label) => {
+        const v = trim(val);
+        if (!v) return null;
+        const id = map.get(v.toLowerCase());
+        if (id == null) errs.push(`${label} not found: "${v}"`);
+        return id;
+    };
+    const getOptional = (map, val) => {
+        const v = trim(val);
+        if (!v) return null;
+        return map.get(v.toLowerCase()) ?? null;
+    };
+
+    const branchId = get(refs.branch, row.branch_name, "branch_name");
+    const projectSchemeId = get(refs.projectScheme, row.project_scheme_name, "project_scheme_name");
+    const orderTypeId = get(refs.orderType, row.order_type_name, "order_type_name");
+    const discomId = get(refs.discom, row.discom_name, "discom_name");
+    const inquirySourceFromCsv = getOptional(refs.inquirySource, row.inquiry_source_name);
+    if (trim(row.inquiry_source_name) && inquirySourceFromCsv == null) {
+        errs.push(`inquiry_source_name not found: "${trim(row.inquiry_source_name)}"`);
+    }
+    const inquirySourceId = inquirySourceFromCsv ?? refs.defaultInquirySourceId ?? null;
+    if (inquirySourceId == null) {
+        errs.push("inquiry_source_name not provided and default 'individual' inquiry source not found in inquiry_sources");
+    }
+    const inquiryById = get(refs.userByEmail, row.inquiry_by_email, "inquiry_by_email");
+    const handledById = get(refs.userByEmail, row.handled_by_email, "handled_by_email");
+
+    const stateId = getOptional(refs.state, row.state_name);
+    let cityId = null;
+    if (row.city_name) {
+        const cityNameLower = (row.city_name || "").toLowerCase().trim();
+        cityId = (stateId && refs.city.get(`${stateId}|${cityNameLower}`)) || refs.city.get(`|${cityNameLower}`) || null;
+    }
+
+    const divisionId = getOptional(refs.division, row.division_name);
+    let subDivisionId = null;
+    if (row.sub_division_name && divisionId) {
+        const subNameLower = (row.sub_division_name || "").toLowerCase().trim();
+        subDivisionId = refs.subDivision.get(`${divisionId}|${subNameLower}`) || null;
+    }
+
+    const channelPartnerId = getOptional(refs.userByEmail, row.channel_partner_email);
+    const plannedWarehouseId = getOptional(refs.warehouse, row.planned_warehouse_name);
+    const fabricatorInstallerId = getOptional(refs.userByEmail, row.fabricator_installer_email);
+
+    const solarPanelId = getOptional(refs.productByName, row.solar_panel);
+    if (trim(row.solar_panel) && solarPanelId == null) errs.push(`solar_panel not found: "${trim(row.solar_panel)}"`);
+    const inverterId = getOptional(refs.productByName, row.inverter);
+    if (trim(row.inverter) && inverterId == null) errs.push(`inverter not found: "${trim(row.inverter)}"`);
+
+    return {
+        branchId,
+        projectSchemeId,
+        orderTypeId,
+        discomId,
+        inquirySourceId,
+        inquiryById,
+        handledById,
+        stateId,
+        cityId,
+        divisionId,
+        subDivisionId,
+        channelPartnerId,
+        plannedWarehouseId,
+        fabricatorInstallerId,
+        solarPanelId,
+        inverterId,
+        errors: errs,
+    };
+}
+
+async function findOrCreateCustomer(row, ids, transaction) {
+    const mobile = trim(row.mobile_number);
+    const name = trim(row.customer_name);
+    if (!mobile && !name) return { customerId: null, error: "mobile_number or customer_name required" };
+
+    let customer = null;
+    if (mobile) {
+        customer = await Customer.findOne({
+            where: { deleted_at: null, mobile_number: mobile },
+            transaction,
+        });
+    }
+    if (!customer && name) {
+        customer = await Customer.findOne({
+            where: { deleted_at: null, customer_name: name },
+            transaction,
+        });
+    }
+
+    if (!customer) {
+        customer = await Customer.create(
+            {
+                customer_name: name || "Unknown",
+                mobile_number: mobile || null,
+                address: trim(row.address) || null,
+                state_id: ids.stateId || null,
+                city_id: ids.cityId || null,
+                pin_code: trim(row.pin_code) || null,
+                company_name: trim(row.company_name) || null,
+                phone_no: trim(row.phone_no) || null,
+                email_id: trim(row.email_id) || null,
+                landmark_area: trim(row.landmark_area) || null,
+                taluka: trim(row.taluka) || null,
+                district: trim(row.district) || null,
+            },
+            { transaction }
+        );
+    }
+
+    return { customerId: customer.id, error: null };
+}
+
+function buildStagePayload(row, currentStageKey, status = "confirmed") {
+    const allCompleted = status === "completed";
+    // For completed orders: every stage is "completed" and current_stage_key = ORDER_COMPLETED_STAGE_KEY (so UI shows "Completed" not "Current")
+    const stages = inferStagesFromCurrentStage(currentStageKey, allCompleted);
+    const effectiveStage = allCompleted ? ORDER_COMPLETED_STAGE_KEY : (trim(currentStageKey) || "estimate_generated");
+    const payload = {
+        stages,
+        current_stage_key: effectiveStage,
+    };
+
+    // When order is completed, set a fallback date for any missing *_completed_at so all stages show as done (including subsidy_disbursed)
+    const completedOrderDate = allCompleted
+        ? (parseDate(row.disbursed_date) || parseDate(row.claim_date) || parseDate(row.order_date) || new Date().toISOString().slice(0, 10))
+        : null;
+
+    if (row.estimate_amount != null && row.estimate_amount !== "") payload.estimate_amount = parseFloatSafe(row.estimate_amount);
+    if (row.estimate_due_date) payload.estimate_due_date = parseDate(row.estimate_due_date);
+    if (row.estimate_paid_at) payload.estimate_paid_at = parseDate(row.estimate_paid_at);
+    if (row.estimate_paid_by) payload.estimate_paid_by = trim(row.estimate_paid_by);
+    if (row.zero_amount_estimate != null && row.zero_amount_estimate !== "")
+        payload.zero_amount_estimate = parseBool(row.zero_amount_estimate);
+    if (allCompleted && !payload.estimate_paid_at && completedOrderDate) payload.estimate_paid_at = completedOrderDate;
+    if (allCompleted && completedOrderDate) payload.estimate_completed_at = parseDate(row.estimate_completed_at) || completedOrderDate;
+
+    if (row.planned_delivery_date) payload.planned_delivery_date = parseDate(row.planned_delivery_date);
+    if (row.planned_priority) payload.planned_priority = trim(row.planned_priority);
+    if (row.planner_completed_at) payload.planner_completed_at = parseDate(row.planner_completed_at);
+    if (allCompleted && !payload.planner_completed_at && completedOrderDate) payload.planner_completed_at = completedOrderDate;
+    if (row.planned_solar_panel_qty != null && row.planned_solar_panel_qty !== "")
+        payload.planned_solar_panel_qty = parseIntegerSafe(row.planned_solar_panel_qty);
+    if (row.planned_inverter_qty != null && row.planned_inverter_qty !== "")
+        payload.planned_inverter_qty = parseIntegerSafe(row.planned_inverter_qty);
+
+    if (row.fabricator_installer_are_same != null && row.fabricator_installer_are_same !== "")
+        payload.fabricator_installer_are_same = parseBool(row.fabricator_installer_are_same);
+    if (row.fabrication_due_date) payload.fabrication_due_date = parseDate(row.fabrication_due_date);
+    if (row.installation_due_date) payload.installation_due_date = parseDate(row.installation_due_date);
+    if (row.fabrication_completed_at) payload.fabrication_completed_at = parseDate(row.fabrication_completed_at);
+    if (allCompleted && !payload.fabrication_completed_at && completedOrderDate) payload.fabrication_completed_at = completedOrderDate;
+    if (row.installation_completed_at) payload.installation_completed_at = parseDate(row.installation_completed_at);
+    if (allCompleted && !payload.installation_completed_at && completedOrderDate) payload.installation_completed_at = completedOrderDate;
+    if (allCompleted && completedOrderDate) payload.assign_fabricator_installer_completed_at = parseDate(row.assign_fabricator_installer_completed_at) || completedOrderDate;
+
+    if (row.netmeter_applied != null && row.netmeter_applied !== "")
+        payload.netmeter_applied = parseBool(row.netmeter_applied);
+    if (row.netmeter_applied_on) payload.netmeter_applied_on = parseDate(row.netmeter_applied_on);
+    if (row.netmeter_installed != null && row.netmeter_installed !== "")
+        payload.netmeter_installed = parseBool(row.netmeter_installed);
+    if (row.netmeter_installed_on) payload.netmeter_installed_on = parseDate(row.netmeter_installed_on);
+    if (allCompleted && completedOrderDate) {
+        if (!payload.netmeter_applied_on) payload.netmeter_applied_on = completedOrderDate;
+        if (!payload.netmeter_installed_on) payload.netmeter_installed_on = completedOrderDate;
+        payload.netmeter_apply_completed_at = parseDate(row.netmeter_apply_completed_at) || completedOrderDate;
+        payload.netmeter_installed_completed_at = parseDate(row.netmeter_installed_completed_at) || completedOrderDate;
+    }
+
+    if (row.subsidy_claim != null && row.subsidy_claim !== "") payload.subsidy_claim = parseBool(row.subsidy_claim);
+    else if (allCompleted) payload.subsidy_claim = true;
+    if (row.claim_date) payload.claim_date = parseDate(row.claim_date);
+    if (row.claim_amount != null && row.claim_amount !== "")
+        payload.claim_amount = parseFloatSafe(row.claim_amount);
+    if (row.subsidy_claim_completed_at) payload.subsidy_claim_completed_at = parseDate(row.subsidy_claim_completed_at);
+    if (allCompleted && !payload.subsidy_claim_completed_at && completedOrderDate) payload.subsidy_claim_completed_at = completedOrderDate;
+
+    if (row.subsidy_disbursed != null && row.subsidy_disbursed !== "")
+        payload.subsidy_disbursed = parseBool(row.subsidy_disbursed);
+    else if (allCompleted) payload.subsidy_disbursed = true;
+    if (row.disbursed_date) payload.disbursed_date = parseDate(row.disbursed_date);
+    if (row.disbursed_amount != null && row.disbursed_amount !== "")
+        payload.disbursed_amount = parseFloatSafe(row.disbursed_amount);
+    if (row.subsidy_disbursed_completed_at) payload.subsidy_disbursed_completed_at = parseDate(row.subsidy_disbursed_completed_at);
+    if (allCompleted && !payload.subsidy_disbursed_completed_at && completedOrderDate) payload.subsidy_disbursed_completed_at = completedOrderDate;
+
+    if (row.order_remarks) payload.order_remarks = trim(row.order_remarks);
+
+    return payload;
+}
+
+async function processRow(row, status, refs, dryRun, errorsOut, context = {}) {
+    const rowNum = (row._rowIndex || 0) + 2; // 1-based + header
+    const orderNumber = trim(getOrderNumberFromRow(row));
+    const existingOrdersByNumber = context.existingOrdersByNumber;
+    const customerCache = context.customerCache;
+    const sharedTransaction = context.transaction;
+    const updateExisting = context.updateExisting === true;
+
+    if (!orderNumber) {
+        errorsOut.push({ row: rowNum, order_number: "", error: "order_number is required" });
+        return { ok: false, skipped: false };
+    }
+
+    if (dryRun) {
+        const preloaded = existingOrdersByNumber?.get(orderNumber);
+        if (!updateExisting && preloaded) {
+            return {
+                ok: true,
+                skipped: true,
+                skipReason: "already_in_db",
+                dryRun: true,
+                orderId: preloaded.id,
+                order_number: orderNumber,
+            };
+        }
+        const idsDry = resolveRowReferences(row, refs);
+        if (idsDry.errors.length) {
+            errorsOut.push({ row: rowNum, order_number: orderNumber, error: idsDry.errors.join("; ") });
+            return { ok: false, skipped: false };
+        }
+        if (!idsDry.inquiryById || !idsDry.handledById) {
+            errorsOut.push({ row: rowNum, order_number: orderNumber, error: "inquiry_by_email and handled_by_email are required" });
+            return { ok: false, skipped: false };
+        }
+        return { ok: true, skipped: false, dryRun: true };
+    }
+
+    const ids = resolveRowReferences(row, refs);
+    if (ids.errors.length) {
+        errorsOut.push({
+            row: rowNum,
+            order_number: orderNumber,
+            error: ids.errors.join("; "),
+        });
+        return { ok: false, skipped: false };
+    }
+
+    if (!ids.inquiryById || !ids.handledById) {
+        errorsOut.push({ row: rowNum, order_number: orderNumber, error: "inquiry_by_email and handled_by_email are required" });
+        return { ok: false, skipped: false };
+    }
+
+    const runInTransaction = async (t) => {
+        let existingOrder = existingOrdersByNumber ? existingOrdersByNumber.get(orderNumber) : null;
+        if (!existingOrder && !existingOrdersByNumber) {
+            existingOrder = await Order.findOne({
+                where: { order_number: orderNumber, deleted_at: null },
+                transaction: t,
+            });
+        }
+
+        if (existingOrder && !updateExisting) {
+            return {
+                ok: true,
+                skipped: true,
+                skipReason: "already_in_db",
+                orderId: existingOrder.id,
+                order_number: orderNumber,
+            };
+        }
+
+        const mobile = trim(row.mobile_number);
+        const name = trim(row.customer_name);
+        const cacheKey = `${mobile}|${name}`;
+        let customerId = customerCache
+            ? (customerCache.get(cacheKey) ?? customerCache.get(`${mobile}|`) ?? customerCache.get(`|${name}`))
+            : undefined;
+        if (customerId === undefined) {
+            const cust = await findOrCreateCustomer(row, ids, t);
+            if (cust.error) {
+                throw new Error(cust.error);
+            }
+            customerId = cust.customerId;
+            if (customerCache) customerCache.set(cacheKey, customerId);
+        }
+
+        const currentStageKey = trim(row.current_stage_key) || "estimate_generated";
+        const isRowClosed = isRowCompleted(row, status, currentStageKey);
+        const rowStatus = isRowClosed ? "completed" : status;
+
+        const basePayload = {
+            status: rowStatus,
+            order_date: parseDate(row.order_date) || new Date().toISOString().slice(0, 10),
+            inquiry_source_id: ids.inquirySourceId,
+            inquiry_by: ids.inquiryById,
+            handled_by: ids.handledById,
+            branch_id: ids.branchId,
+            channel_partner_id: ids.channelPartnerId || null,
+            project_scheme_id: ids.projectSchemeId,
+            capacity: parseFloatSafeOrZero(row.capacity) || 0,
+            project_cost: parseFloatSafeOrZero(row.project_cost) || 0,
+            discount: parseFloatSafeOrZero(row.discount) || 0,
+            order_type_id: ids.orderTypeId,
+            customer_id: customerId,
+            discom_id: ids.discomId,
+            consumer_no: trim(row.consumer_no) || "",
+            division_id: ids.divisionId || null,
+            sub_division_id: ids.subDivisionId || null,
+            circle: trim(row.circle) || null,
+            reference_from: trim(row.reference_from) || null,
+            solar_panel_id: ids.solarPanelId ?? null,
+            inverter_id: ids.inverterId ?? null,
+            application_no: trim(row.application_no) || null,
+            date_of_registration_gov: parseDate(row.registration_date) || null,
+            payment_type: trim(row.payment_type) || null,
+        };
+
+        const stagePayload = buildStagePayload(row, currentStageKey, rowStatus);
+        stagePayload.planned_warehouse_id = ids.plannedWarehouseId || null;
+        stagePayload.fabricator_installer_id = ids.fabricatorInstallerId || null;
+        stagePayload.fabricator_id = ids.fabricatorInstallerId || null;
+        stagePayload.installer_id = ids.fabricatorInstallerId || null;
+
+        if (existingOrder) {
+            const updatePayload = { ...basePayload, ...stagePayload };
+            if (row.order_remarks) updatePayload.order_remarks = trim(row.order_remarks);
+            await orderService.updateOrder({ id: existingOrder.id, payload: updatePayload, transaction: t });
+            return { ok: true, skipped: false, updated: true, orderId: existingOrder.id, order_number: orderNumber };
+        }
+
+        const createPayload = { order_number: orderNumber, ...basePayload };
+        const created = await orderService.createOrder({ payload: createPayload, transaction: t });
+        const orderId = created.id;
+        await orderService.updateOrder({ id: orderId, payload: stagePayload, transaction: t });
+        return { ok: true, skipped: false, orderId, order_number: orderNumber };
+    };
+
+    if (sharedTransaction) {
+        return runInTransaction(sharedTransaction);
+    }
+
+    const t = await db.sequelize.transaction();
+    try {
+        const result = await runInTransaction(t);
+        await t.commit();
+        return result;
+    } catch (err) {
+        await t.rollback();
+        errorsOut.push({
+            row: rowNum,
+            order_number: orderNumber,
+            error: err.message || String(err),
+        });
+        return { ok: false, skipped: false };
+    }
+}
+
+function writeResultExcel(errors, createdRows, updatedRows, skippedExistingRows, outputPath) {
+    const workbook = new ExcelJS.Workbook();
+
+    const errorsSheet = workbook.addWorksheet("errors", { headerRow: true });
+    errorsSheet.columns = [
+        { header: "row", key: "row", width: 8 },
+        { header: "order_number", key: "order_number", width: 22 },
+        { header: "error", key: "error", width: 50 },
+    ];
+    errorsSheet.getRow(1).font = { bold: true };
+    (errors || []).forEach((e) => {
+        errorsSheet.addRow({ row: e.row, order_number: e.order_number || "", error: e.error || "" });
+    });
+
+    const createdSheet = workbook.addWorksheet("created", { headerRow: true });
+    createdSheet.columns = [
+        { header: "row", key: "row", width: 8 },
+        { header: "order_number", key: "order_number", width: 22 },
+        { header: "order_id", key: "order_id", width: 12 },
+    ];
+    createdSheet.getRow(1).font = { bold: true };
+    (createdRows || []).forEach((r) => {
+        createdSheet.addRow({ row: r.row, order_number: r.order_number || "", order_id: r.order_id ?? "" });
+    });
+
+    const updatedSheet = workbook.addWorksheet("updated", { headerRow: true });
+    updatedSheet.columns = [
+        { header: "row", key: "row", width: 8 },
+        { header: "order_number", key: "order_number", width: 22 },
+        { header: "order_id", key: "order_id", width: 12 },
+    ];
+    updatedSheet.getRow(1).font = { bold: true };
+    (updatedRows || []).forEach((r) => {
+        updatedSheet.addRow({ row: r.row, order_number: r.order_number || "", order_id: r.order_id ?? "" });
+    });
+
+    const skippedSheet = workbook.addWorksheet("skipped_existing", { headerRow: true });
+    skippedSheet.columns = [
+        { header: "row", key: "row", width: 8 },
+        { header: "order_number", key: "order_number", width: 22 },
+        { header: "order_id", key: "order_id", width: 12 },
+        { header: "reason", key: "reason", width: 20 },
+    ];
+    skippedSheet.getRow(1).font = { bold: true };
+    (skippedExistingRows || []).forEach((r) => {
+        skippedSheet.addRow({
+            row: r.row,
+            order_number: r.order_number || "",
+            order_id: r.order_id ?? "",
+            reason: r.reason || "already_in_db",
+        });
+    });
+
+    return workbook.xlsx.writeFile(outputPath);
+}
+
+function inferStatusFromFilename(filePath) {
+    const base = path.basename(String(filePath || "")).toLowerCase();
+    if (base.includes("completed")) return "completed";
+    return "confirmed";
+}
+
+/** Process a single batch in its own transaction; returns counts and rows for merging. */
+async function processOneBatch(
+    batch,
+    batchStart,
+    batchNum,
+    totalBatches,
+    totalInFile,
+    status,
+    refs,
+    existingOrdersByNumber,
+    updateExisting
+) {
+    const batchStartTime = Date.now();
+    const rowRange = `${batchStart + 1}-${batchStart + batch.length}`;
+    console.log(`  [Batch ${batchNum}/${totalBatches}] Started (rows ${rowRange}, ${batch.length} orders)…`);
+
+    const batchErrors = [];
+    const batchCreated = [];
+    const batchUpdated = [];
+    const batchSkippedExisting = [];
+    let batchCreatedCount = 0;
+    let batchUpdatedCount = 0;
+    let batchFailedCount = 0;
+    let batchSkippedExistingCount = 0;
+
+    for (let i = 0; i < batch.length; i++) {
+        batch[i]._rowIndex = batchStart + i;
+        normalizeCsvRow(batch[i]);
+    }
+
+    const customerCache = await preloadCustomersForBatch(batch);
+    const t = await db.sequelize.transaction();
+    const batchContext = {
+        existingOrdersByNumber,
+        customerCache,
+        transaction: t,
+        updateExisting,
+    };
+    let batchRolledBack = false;
+
+    for (let i = 0; i < batch.length; i++) {
+        const row = batch[i];
+        const rowNum = (row._rowIndex || 0) + 2;
+        const orderNumber = trim(getOrderNumberFromRow(row)) || "(no order_number)";
+        let result;
+        try {
+            result = await processRow(row, status, refs, false, batchErrors, batchContext);
+        } catch (err) {
+            if (!batchRolledBack) {
+                await t.rollback();
+                batchRolledBack = true;
+            }
+            batchFailedCount++;
+            batchErrors.push({ row: rowNum, order_number: orderNumber, error: err.message || String(err) });
+            break;
+        }
+        if (result.updated) {
+            batchUpdatedCount++;
+            batchUpdated.push({ row: rowNum, order_number: result.order_number || "", order_id: result.orderId ?? "" });
+        } else if (result.skipped && result.skipReason === "already_in_db") {
+            batchSkippedExistingCount++;
+            batchSkippedExisting.push({
+                row: rowNum,
+                order_number: result.order_number || "",
+                order_id: result.orderId ?? "",
+                reason: result.skipReason,
+            });
+        } else if (result.ok) {
+            batchCreatedCount++;
+            batchCreated.push({ row: rowNum, order_number: result.order_number || "", order_id: result.orderId ?? "" });
+        } else {
+            batchFailedCount++;
+        }
+    }
+
+    if (!batchRolledBack) {
+        try {
+            await t.commit();
+        } catch (commitErr) {
+            batchFailedCount += batch.length;
+            batchErrors.push({
+                row: batchStart + 2,
+                order_number: "(batch)",
+                error: `Batch commit failed: ${commitErr.message || commitErr}`,
+            });
+        }
+    }
+
+    const elapsedSec = ((Date.now() - batchStartTime) / 1000).toFixed(1);
+    console.log(
+        `  [Batch ${batchNum}/${totalBatches}] Done in ${elapsedSec}s – created: ${batchCreatedCount}, updated: ${batchUpdatedCount}, skipped_existing: ${batchSkippedExistingCount}, failed: ${batchFailedCount}`
+    );
+
+    return {
+        batchCount: batch.length,
+        created: batchCreatedCount,
+        updated: batchUpdatedCount,
+        failed: batchFailedCount,
+        skippedExisting: batchSkippedExistingCount,
+        errors: batchErrors,
+        createdRows: batchCreated,
+        updatedRows: batchUpdated,
+        skippedExistingRows: batchSkippedExisting,
+        batchNum,
+        totalBatches,
+    };
+}
+
+/** Run async tasks with a concurrency limit; returns results in task order. */
+async function runWithConcurrency(tasks, concurrency) {
+    if (concurrency <= 1) {
+        const results = [];
+        for (const t of tasks) results.push(await t());
+        return results;
+    }
+    const results = new Array(tasks.length);
+    let next = 0;
+    async function worker() {
+        while (next < tasks.length) {
+            const i = next++;
+            if (i >= tasks.length) break;
+            results[i] = await tasks[i]();
+        }
+    }
+    const workers = Array.from({ length: Math.min(concurrency, tasks.length) }, () => worker());
+    await Promise.all(workers);
+    return results;
+}
+
+async function main() {
+    const args = process.argv.slice(2);
+    const files = [];
+    let dryRun = false;
+    let updateExisting = false;
+
+    for (let i = 0; i < args.length; i++) {
+        if (args[i] === "--file" && args[i + 1]) {
+            files.push(args[++i]);
+        } else if (args[i] === "--dry-run") {
+            dryRun = true;
+        } else if (args[i] === "--update-existing") {
+            updateExisting = true;
+        }
+    }
+
+    if (files.length === 0) {
+        console.error(
+            "Usage: node scripts/order-import/import-orders.js --file <path> [--file <path>...] [--dry-run] [--update-existing]"
+        );
+        process.exit(1);
+    }
+
+    console.log("Order Import – Go Live Migration");
+    if (dryRun) console.log("DRY RUN – no changes will be written.\n");
+    if (updateExisting) {
+        console.log("Mode: existing order_numbers will be UPDATED from CSV.\n");
+    } else {
+        console.log("Mode: existing order_numbers will be SKIPPED (not touched). Use --update-existing to upsert.\n");
+    }
+
+    const errors = [];
+    const createdRows = [];
+    const updatedRows = [];
+    const skippedExistingRows = [];
+    let total = 0;
+    let created = 0;
+    let updated = 0;
+    let skippedExisting = 0;
+    let failed = 0;
+
+    const refs = await resolveReferences();
+
+    for (const filePath of files) {
+        const resolvedPath = path.resolve(filePath);
+        if (!fs.existsSync(resolvedPath)) {
+            console.error("File not found:", resolvedPath);
+            continue;
+        }
+
+        const status = inferStatusFromFilename(resolvedPath);
+        console.log(`\nProcessing: ${resolvedPath} (status=${status})`);
+
+        const content = fs.readFileSync(resolvedPath, "utf8");
+        let rows;
+        try {
+            rows = parse(content, {
+                columns: true,
+                skip_empty_lines: true,
+                trim: true,
+                relax_column_count: true,
+                relax_quotes: true,
+            });
+        } catch (e) {
+            console.error("CSV parse error:", e.message);
+            continue;
+        }
+
+        const totalInFile = rows.length;
+        console.log(`Records to process: ${totalInFile}\n`);
+
+        let existingOrdersByNumber = new Map();
+        if (rows.length > 0) {
+            const orderNumbers = rows.map((r) => trim(getOrderNumberFromRow(r))).filter(Boolean);
+            existingOrdersByNumber = await loadExistingOrdersByNumber(orderNumbers);
+            console.log(`Pre-loaded ${existingOrdersByNumber.size} existing order(s) for this file (by order_number).`);
+            if (dryRun) {
+                console.log("");
+            } else {
+                console.log(
+                    updateExisting
+                        ? "Existing orders will be UPDATED; new orders will be created."
+                        : "Existing orders will be SKIPPED; only new order_numbers will be imported."
+                );
+                console.log(
+                    `Starting ${Math.ceil(rows.length / BATCH_SIZE)} batches (${PARALLEL_BATCH_CONCURRENCY} parallel)…\n`
+                );
+            }
+        }
+
+        if (dryRun) {
+            let drySkippedExisting = 0;
+            for (let batchStart = 0; batchStart < rows.length; batchStart += BATCH_SIZE) {
+                const batch = rows.slice(batchStart, Math.min(batchStart + BATCH_SIZE, rows.length));
+                const batchNum = Math.floor(batchStart / BATCH_SIZE) + 1;
+                const totalBatches = Math.ceil(rows.length / BATCH_SIZE);
+                for (let i = 0; i < batch.length; i++) {
+                    batch[i]._rowIndex = batchStart + i;
+                    normalizeCsvRow(batch[i]);
+                    total++;
+                    const dryContext = { existingOrdersByNumber, updateExisting };
+                    const result = await processRow(batch[i], status, refs, true, errors, dryContext);
+                    if (result.skipped && result.skipReason === "already_in_db") {
+                        drySkippedExisting++;
+                        skippedExistingRows.push({
+                            row: (batch[i]._rowIndex || 0) + 2,
+                            order_number: result.order_number || "",
+                            order_id: result.orderId ?? "",
+                            reason: result.skipReason,
+                        });
+                    }
+                    if (!result.ok) console.log(`  Row ${(batch[i]._rowIndex || 0) + 2} FAILED: ${errors[errors.length - 1]?.error ?? "Unknown"}`);
+                }
+                if (batch.length > 0) console.log(`  Dry run batch ${batchNum}/${totalBatches}: ${batch.length} rows`);
+            }
+            skippedExisting += drySkippedExisting;
+            if (drySkippedExisting > 0) console.log(`  Dry run – would skip (already in DB): ${drySkippedExisting}`);
+            continue;
+        }
+
+        const totalBatches = Math.ceil(rows.length / BATCH_SIZE);
+        const batchTasks = [];
+        for (let batchStart = 0; batchStart < rows.length; batchStart += BATCH_SIZE) {
+            const batchEnd = Math.min(batchStart + BATCH_SIZE, rows.length);
+            const batch = rows.slice(batchStart, batchEnd);
+            const batchNum = Math.floor(batchStart / BATCH_SIZE) + 1;
+            batchTasks.push(() =>
+                processOneBatch(
+                    batch,
+                    batchStart,
+                    batchNum,
+                    totalBatches,
+                    rows.length,
+                    status,
+                    refs,
+                    existingOrdersByNumber,
+                    updateExisting
+                )
+            );
+        }
+
+        const batchResults = await runWithConcurrency(batchTasks, PARALLEL_BATCH_CONCURRENCY);
+
+        for (const r of batchResults) {
+            total += r.batchCount;
+            created += r.created;
+            updated += r.updated;
+            failed += r.failed;
+            skippedExisting += r.skippedExisting;
+            errors.push(...r.errors);
+            createdRows.push(...r.createdRows);
+            updatedRows.push(...r.updatedRows);
+            skippedExistingRows.push(...(r.skippedExistingRows || []));
+        }
+    }
+
+    console.log("\n--- Summary ---");
+    console.log("Total rows:", total);
+    console.log("Created:", created);
+    console.log("Updated:", updated);
+    console.log("Skipped (already in database):", skippedExisting);
+    console.log("Failed:", failed);
+
+    const resultPath = path.resolve(process.cwd(), "import-result.xlsx");
+    await writeResultExcel(errors, createdRows, updatedRows, skippedExistingRows, resultPath);
+    console.log("Result file (errors, created, updated, skipped_existing):", resultPath);
+
+    await db.sequelize.close();
+    process.exit(failed > 0 ? 1 : 0);
+}
+
+main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+});

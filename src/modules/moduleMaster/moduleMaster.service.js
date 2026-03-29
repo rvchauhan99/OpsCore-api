@@ -1,0 +1,216 @@
+const ExcelJS = require('exceljs');
+const { Op } = require('sequelize');
+const AppError = require('../../common/errors/AppError.js');
+const { RESPONSE_STATUS_CODES } = require('../../common/utils/constants.js');
+const { getTenantModels } = require('../tenant/tenantModels.js');
+
+const createModule = async (payload, transaction = null) => {
+  const models = getTenantModels();
+  const { Module } = models;
+  // check duplicate name or key (excluding soft-deleted)
+  const existing = await Module.findOne({
+    where: {
+      [Op.or]: [{ name: payload.name }, { key: payload.key }],
+      deleted_at: null,
+    },
+    transaction,
+  });
+
+  if (existing) {
+    throw new AppError('Module with same name or key already exists', RESPONSE_STATUS_CODES.BAD_REQUEST);
+  }
+
+  // Auto-assign sequence when 0, blank, or null
+  const seqVal = payload.sequence;
+  const isAutoSeq = seqVal === undefined || seqVal === null || seqVal === '' || Number(seqVal) === 0;
+  if (isAutoSeq) {
+    const maxSeq = await Module.max('sequence', {
+      where: { deleted_at: null },
+      transaction,
+    });
+    payload.sequence = (maxSeq ?? 0) + 1;
+  } else {
+    // If sequence provided, ensure it's unique (excluding soft-deleted)
+    const seqExists = await Module.findOne({
+      where: { sequence: payload.sequence, deleted_at: null },
+      transaction,
+    });
+    if (seqExists) {
+      throw new AppError('Sequence already exists, try with different Sequence number', RESPONSE_STATUS_CODES.BAD_REQUEST);
+    }
+  }
+
+  const created = await Module.create(payload, { transaction });
+  return created.toJSON();
+};
+
+const getModuleById = async (id, transaction = null) => {
+  const models = getTenantModels();
+  const { Module } = models;
+  const module = await Module.findOne({ where: { id, deleted_at: null }, transaction });
+  if (!module) throw new AppError('Module not found', RESPONSE_STATUS_CODES.NOT_FOUND);
+  return module.toJSON();
+};
+
+const listModules = async ({
+  page = 1,
+  limit = 20,
+  q = null,
+  status = null,
+  sortBy = 'id',
+  sortOrder = 'DESC',
+  id = null,
+  name = null,
+  name_op = null,
+  key: keyFilter = null,
+  key_op = null,
+  route = null,
+  route_op = null,
+  sequence,
+  sequence_op,
+  sequence_to,
+} = {}) => {
+  const models = getTenantModels();
+  const { Module } = models;
+  const offset = (page - 1) * limit;
+  const where = { deleted_at: null };
+  const andConds = [];
+  if (id != null && id !== '') {
+    const v = parseInt(id, 10);
+    if (!Number.isNaN(v)) andConds.push({ id: v });
+  }
+  if (name) {
+    andConds.push({ name: { [Op.iLike]: `%${name}%` } });
+  }
+  if (keyFilter) {
+    andConds.push({ key: { [Op.iLike]: `%${keyFilter}%` } });
+  }
+  if (route) {
+    andConds.push({ route: { [Op.iLike]: `%${route}%` } });
+  }
+  if (sequence != null || sequence_to != null) {
+    const v = parseFloat(sequence);
+    const vTo = parseFloat(sequence_to);
+    if (!Number.isNaN(v) || !Number.isNaN(vTo)) {
+      const cond = {};
+      const op = (sequence_op || '').toLowerCase();
+      if (op === 'between' && !Number.isNaN(v) && !Number.isNaN(vTo)) cond[Op.between] = [v, vTo];
+      else if (op === 'gt' && !Number.isNaN(v)) cond[Op.gt] = v;
+      else if (op === 'lt' && !Number.isNaN(v)) cond[Op.lt] = v;
+      else if (op === 'gte' && !Number.isNaN(v)) cond[Op.gte] = v;
+      else if (op === 'lte' && !Number.isNaN(v)) cond[Op.lte] = v;
+      else if (!Number.isNaN(v)) cond[Op.eq] = v;
+      if (Reflect.ownKeys(cond).length > 0) andConds.push({ sequence: cond });
+    }
+  }
+  if (andConds.length) where[Op.and] = where[Op.and] ? [...(Array.isArray(where[Op.and]) ? where[Op.and] : [where[Op.and]]), ...andConds] : andConds;
+  if (q) {
+    const searchCond = {
+      [Op.or]: [
+        { name: { [Op.iLike]: `%${q}%` } },
+        { key: { [Op.iLike]: `%${q}%` } },
+      ],
+    };
+    where[Op.and] = where[Op.and] ? [...(Array.isArray(where[Op.and]) ? where[Op.and] : []), searchCond] : [searchCond];
+  }
+  if (status) where.status = status;
+
+  const rows = await Module.findAll({
+    where,
+    offset,
+    limit,
+    order: [[sortBy, sortOrder]],
+  });
+
+  // Second query: get total count separately
+  const count = await Module.count({ where });
+
+  // Normalize rows to plain objects
+  const data = Array.isArray(rows) ? rows.map((r) => (r && typeof r.toJSON === 'function' ? r.toJSON() : r)) : [];
+
+  return { data, meta: { page, limit, total: count, pages: limit > 0 ? Math.ceil(count / limit) : 0 } };
+};
+
+const updateModule = async (id, updates, transaction = null) => {
+  const models = getTenantModels();
+  const { Module } = models;
+  const module = await Module.findOne({ where: { id, deleted_at: null }, transaction });
+  if (!module) throw new AppError('Module not found', RESPONSE_STATUS_CODES.NOT_FOUND);
+
+  // Update: preserve existing sequence unless an explicit value is provided.
+  if (Object.prototype.hasOwnProperty.call(updates || {}, "sequence")) {
+    const seqVal = updates.sequence;
+    const isAutoSeq = seqVal === null || seqVal === '';
+    if (isAutoSeq) {
+      const maxSeq = await Module.max('sequence', {
+        where: { deleted_at: null },
+        transaction,
+      });
+      updates.sequence = (maxSeq ?? 0) + 1;
+    } else {
+      // If sequence is provided, ensure it's not used by another module
+      const seqExists = await Module.findOne({
+        where: {
+          sequence: updates.sequence,
+          deleted_at: null,
+          id: { [Op.ne]: id },
+        },
+        transaction,
+      });
+      if (seqExists) {
+        throw new AppError('Sequence already exists, try with different Sequence number', RESPONSE_STATUS_CODES.BAD_REQUEST);
+      }
+    }
+  }
+
+  await module.update({ ...updates }, { transaction });
+  return module.toJSON();
+};
+
+const deleteModule = async (id, transaction = null) => {
+  const models = getTenantModels();
+  const { Module } = models;
+  await Module.destroy({ where: { id }, transaction });
+  return true;
+};
+
+const exportModules = async (params = {}) => {
+  const { data } = await listModules({ ...params, page: 1, limit: 10000 });
+  const workbook = new ExcelJS.Workbook();
+  const worksheet = workbook.addWorksheet('Modules');
+  worksheet.columns = [
+    { header: 'Name', key: 'name', width: 24 },
+    { header: 'Key', key: 'key', width: 18 },
+    { header: 'Route', key: 'route', width: 24 },
+    { header: 'Icon', key: 'icon', width: 14 },
+    { header: 'Sequence', key: 'sequence', width: 10 },
+    { header: 'Status', key: 'status', width: 12 },
+    { header: 'Authorize with params', key: 'authorize_with_params', width: 18 },
+    { header: 'Created At', key: 'created_at', width: 22 },
+  ];
+  worksheet.getRow(1).font = { bold: true };
+  worksheet.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE0E0E0' } };
+  (data || []).forEach((m) => {
+    worksheet.addRow({
+      name: m.name || '',
+      key: m.key || '',
+      route: m.route || '',
+      icon: m.icon || '',
+      sequence: m.sequence != null ? m.sequence : '',
+      status: m.status || '',
+      authorize_with_params: m.authorize_with_params ? 'Yes' : 'No',
+      created_at: m.created_at ? new Date(m.created_at).toISOString() : '',
+    });
+  });
+  const buffer = await workbook.xlsx.writeBuffer();
+  return buffer;
+};
+
+module.exports = {
+  createModule,
+  getModuleById,
+  listModules,
+  exportModules,
+  updateModule,
+  deleteModule,
+};

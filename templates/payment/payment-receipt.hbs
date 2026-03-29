@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Payment Receipt</title>
+  <style>{{{styles}}}</style>
+</head>
+<body>
+  <header class="copy-header">
+    <div class="company-block">
+      {{#if company.logo_data_url}}
+      <img class="logo" src="{{company.logo_data_url}}" alt="Company Logo" />
+      {{/if}}
+      <div>
+        <h1>{{safe company.name}}</h1>
+        <p>{{safe company.address}}</p>
+        <p>{{safe company.phone}}{{#if company.email}} | {{company.email}}{{/if}}</p>
+      </div>
+    </div>
+    <div class="copy-meta">
+      <div class="copy-label">PAYMENT RECEIPT</div>
+      {{#if payment.receipt_number}}
+      <div class="meta-row"><span>Receipt No</span><strong>{{safe payment.receipt_number}}</strong></div>
+      {{/if}}
+      <div class="meta-row"><span>Payment Date</span><strong>{{formatDate payment.date_of_payment}}</strong></div>
+      {{#if order.order_number}}
+      <div class="meta-row"><span>Order No</span><strong>{{safe order.order_number}}</strong></div>
+      {{/if}}
+    </div>
+  </header>
+
+  <div class="grid grid-3">
+    <article class="card">
+      <h3>Customer</h3>
+      {{#if order}}
+        <p><strong>{{safe order.customer_name}}</strong></p>
+        <p>{{safe order.address}}</p>
+        {{#if order.phone}}<p>{{safe order.phone}}</p>{{/if}}
+      {{else}}
+        <p class="muted">-</p>
+      {{/if}}
+    </article>
+    <article class="card">
+      <h3>Payment Details</h3>
+      <p><span>Amount</span><strong>{{formatCurrency payment.payment_amount}}</strong></p>
+      <p><span>Mode</span><strong>{{safe payment.payment_mode_name}}</strong></p>
+      <p><span>In Words</span><strong>{{safe payment.payment_amount_in_words}} only</strong></p>
+      {{#if payment.transaction_cheque_number}}
+      <p><span>Cheque / Txn No</span><strong>{{safe payment.transaction_cheque_number}}</strong></p>
+      {{/if}}
+      {{#if payment.transaction_cheque_date}}
+      <p><span>Cheque / Txn Date</span><strong>{{formatDate payment.transaction_cheque_date}}</strong></p>
+      {{/if}}
+      {{#if payment.bank_name}}
+      <p><span>Bank</span><strong>{{safe payment.bank_name}}</strong></p>
+      {{/if}}
+    </article>
+    <article class="card">
+      <h3>Remarks</h3>
+      {{#if bank}}
+        {{#if bank.bank_name}}
+        <p><span>Bank</span><strong>{{safe bank.bank_name}}</strong></p>
+        {{/if}}
+        {{#if bank.account_name}}
+        <p><span>Account</span><strong>{{safe bank.account_name}}</strong></p>
+        {{/if}}
+      {{else}}
+        <p class="muted">-</p>
+      {{/if}}
+    </article>
+  </div>
+
+  <table class="items-table">
+    <thead>
+      <tr>
+        <th>#</th>
+        <th>Description</th>
+        <th>Payment Mode</th>
+        <th class="num">Amount</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>1</td>
+        <td class="wrap">{{#if order}}Project Capacity: {{order.capacity}}{{else}}Payment{{/if}}</td>
+        <td>{{safe payment.payment_mode_name}}</td>
+        <td class="num">{{formatCurrency payment.payment_amount}}</td>
+      </tr>
+    </tbody>
+    <tfoot>
+      <tr class="grand-total">
+        <td colspan="3" class="total-label">Total</td>
+        <td class="num"><strong>{{formatCurrency payment.payment_amount}}</strong></td>
+      </tr>
+    </tfoot>
+  </table>
+
+  <div class="notes-signatures single-sign">
+    <article class="sign">
+      <h4>Authorized Signatory</h4>
+      <p class="for-company">For, {{safe company.name}}</p>
+      {{#if company.stamp_with_signature_data_url}}
+        <img class="stamp-sign" src="{{company.stamp_with_signature_data_url}}" alt="Stamp with Signature" />
+      {{else}}
+        {{#if company.stamp_data_url}}
+          <img class="stamp" src="{{company.stamp_data_url}}" alt="Company Stamp" />
+        {{/if}}
+        {{#if company.authorized_signature_data_url}}
+          <img class="signature" src="{{company.authorized_signature_data_url}}" alt="Authorized Signature" />
+        {{/if}}
+      {{/if}}
+      <p class="authorized-text">(Authorized Signatory)</p>
+    </article>
+  </div>
+
+  <div class="receipt-footer muted">
+    <span>This is a system-generated receipt.</span>
+    <span>Generated on: {{safe generated_at}}</span>
+  </div>
+</body>
+</html>

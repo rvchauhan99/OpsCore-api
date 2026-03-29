@@ -1,0 +1,180 @@
+"use strict";
+
+const { asyncHandler } = require("../../common/utils/asyncHandler.js");
+const responseHandler = require("../../common/utils/responseHandler.js");
+const poInwardService = require("./poInward.service.js");
+const purchaseOrderService = require("../purchaseOrder/purchaseOrder.service.js");
+
+const list = asyncHandler(async (req, res) => {
+  const {
+    page = 1,
+    limit = 20,
+    q = null,
+    status = null,
+    sortBy = "id",
+    sortOrder = "DESC",
+    supplier_invoice_number: supplierInvoiceNumber = null,
+    received_at_from: receivedAtFrom = null,
+    received_at_to: receivedAtTo = null,
+    po_number: poNumber = null,
+    supplier_name: supplierName = null,
+    warehouse_name: warehouseName = null,
+    total_received_quantity,
+    total_received_quantity_op,
+    total_received_quantity_to,
+    total_accepted_quantity,
+    total_accepted_quantity_op,
+    total_accepted_quantity_to,
+  } = req.query;
+  const result = await poInwardService.listPOInwards({
+    page: parseInt(page),
+    limit: parseInt(limit),
+    q,
+    status,
+    sortBy,
+    sortOrder,
+    supplier_invoice_number: supplierInvoiceNumber,
+    received_at_from: receivedAtFrom,
+    received_at_to: receivedAtTo,
+    po_number: poNumber,
+    supplier_name: supplierName,
+    warehouse_name: warehouseName,
+    total_received_quantity,
+    total_received_quantity_op,
+    total_received_quantity_to,
+    total_accepted_quantity,
+    total_accepted_quantity_op,
+    total_accepted_quantity_to,
+  });
+  return responseHandler.sendSuccess(res, result, "PO Inward list fetched", 200);
+});
+
+const exportList = asyncHandler(async (req, res) => {
+  const {
+    q = null,
+    status = null,
+    sortBy = "id",
+    sortOrder = "DESC",
+    supplier_invoice_number: supplierInvoiceNumber = null,
+    received_at_from: receivedAtFrom = null,
+    received_at_to: receivedAtTo = null,
+    po_number: poNumber = null,
+    supplier_name: supplierName = null,
+    warehouse_name: warehouseName = null,
+    total_received_quantity,
+    total_received_quantity_op,
+    total_received_quantity_to,
+    total_accepted_quantity,
+    total_accepted_quantity_op,
+    total_accepted_quantity_to,
+  } = req.query;
+  const buffer = await poInwardService.exportPOInwards({
+    q,
+    status,
+    sortBy,
+    sortOrder,
+    supplier_invoice_number: supplierInvoiceNumber,
+    received_at_from: receivedAtFrom,
+    received_at_to: receivedAtTo,
+    po_number: poNumber,
+    supplier_name: supplierName,
+    warehouse_name: warehouseName,
+    total_received_quantity,
+    total_received_quantity_op,
+    total_received_quantity_to,
+    total_accepted_quantity,
+    total_accepted_quantity_op,
+    total_accepted_quantity_to,
+  });
+  const filename = `po-inwards-${new Date().toISOString().split("T")[0]}.xlsx`;
+  res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+  res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+  return res.send(buffer);
+});
+
+/** Get PO details by id for use when creating a PO Inward (does not require purchase-orders module access) */
+const getPODetailsForInward = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const po = await purchaseOrderService.getPurchaseOrderById({ id });
+  if (!po) {
+    return responseHandler.sendError(res, "Purchase order not found", 404);
+  }
+  return responseHandler.sendSuccess(res, po, "PO details fetched", 200);
+});
+
+const getById = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const item = await poInwardService.getPOInwardById({ id });
+  if (!item) {
+    return responseHandler.sendError(res, "PO Inward not found", 404);
+  }
+  return responseHandler.sendSuccess(res, item, "PO Inward fetched", 200);
+});
+
+const create = asyncHandler(async (req, res) => {
+  const payload = { ...req.body, received_by: req.user.id };
+  try {
+    const created = await poInwardService.createPOInward({
+      payload,
+      transaction: req.transaction,
+    });
+    return responseHandler.sendSuccess(res, created, "PO Inward created", 201);
+  } catch (err) {
+    if (err.name === "SequelizeUniqueConstraintError") {
+      return responseHandler.sendError(res, "Duplicate serial number for this product type. Use a unique serial within the same product type.", 400);
+    }
+    throw err;
+  }
+});
+
+const update = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const payload = { ...req.body };
+  try {
+    const updated = await poInwardService.updatePOInward({
+      id,
+      payload,
+      transaction: req.transaction,
+    });
+    return responseHandler.sendSuccess(res, updated, "PO Inward updated", 200);
+  } catch (err) {
+    if (err.name === "SequelizeUniqueConstraintError") {
+      return responseHandler.sendError(res, "Duplicate serial number for this product type. Use a unique serial within the same product type.", 400);
+    }
+    throw err;
+  }
+});
+
+const approve = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const approved = await poInwardService.approvePOInward({
+    id,
+    transaction: req.transaction,
+  });
+  return responseHandler.sendSuccess(res, approved, "PO Inward approved", 200);
+});
+
+const validateSerials = asyncHandler(async (req, res) => {
+  const { product_id, serial_numbers, po_inward_id } = req.body || {};
+  if (product_id == null || !Array.isArray(serial_numbers)) {
+    return responseHandler.sendError(res, "product_id and serial_numbers are required", 400);
+  }
+  const result = await poInwardService.validatePOInwardSerials({
+    product_id: parseInt(product_id, 10),
+    serial_numbers,
+    po_inward_id: po_inward_id != null ? parseInt(po_inward_id, 10) : undefined,
+  });
+  return responseHandler.sendSuccess(res, result, "Serials validated", 200);
+});
+
+module.exports = {
+  list,
+  exportList,
+  getPODetailsForInward,
+  getById,
+  create,
+  update,
+  approve,
+  validateSerials,
+};
+
